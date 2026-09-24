@@ -6,13 +6,10 @@
                 "limitSymbolsToIncludedHeaders": false
             },
             "includePath": [
-                "/data/epos_controller_ws/install/epos4_driver/include/**",
+                "${workspaceFolder}/include/**",
+                "/data/epos_ws/src/ros2units/include",
                 "/opt/ros/humble/include/**",
-                "/data/epos_controller_ws/src/epos4_driver/include/**",
-                "/data/epos_controller_ws/src/epos4_ros2_control/include/**",
-                "/usr/include/**",
-                "${workspaceFolder}/src/robot_units/include",
-                "${workspaceFolder}/install/epos4_driver/include"
+                "/usr/include/**"
             ],
             "name": "ros2",
             "intelliSenseMode": "gcc-x64",

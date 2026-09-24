@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>eposlib</name>
+  <version>0.1.0</version>
+  <description>
+    C++ API for maxon EPOS4 controllers over CANopen (CiA 301 / CiA 402),
+    built on Lely CANopen. Plain CMake, no ROS dependency: this manifest only
+    lets colcon and rosdep build it inside a ROS workspace too.
+  </description>
+  <maintainer email="cabreratrejoimadjared@gmail.com">Imad Jared Cabrera Trejo</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>cmake</buildtool_depend>
+  <build_depend>pkg-config</build_depend>
+
+  <!-- Lely CANopen: the libraries and dcfgen. Under ROS this key resolves to
+       ros-<distro>-lely-core-libraries; without ROS, install Lely itself. -->
+  <depend>lely_core_libraries</depend>
+
+  <!-- Units for every quantity in the API: https://github.com/Imcab/ros2units -->
+  <depend>ros2units</depend>
+
+  <test_depend>gtest</test_depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>

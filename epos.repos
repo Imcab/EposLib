@@ -1,0 +1,11 @@
+# The repositories an eposlib workspace needs, for vcstool. From the src/
+# directory of a colcon workspace that already has eposlib cloned in it:
+#
+#   vcs import . < eposlib/epos.repos
+#
+# Outside ROS, clone ros2units anywhere and add it to CMAKE_PREFIX_PATH.
+repositories:
+  ros2units:
+    type: git
+    url: https://github.com/Imcab/ros2units.git
+    version: main

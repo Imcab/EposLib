@@ -1,15 +1,13 @@
 # ---------------------------------------------------------------------------
-# colcon build artefacts
+# Build output
+#
+# `cmake -S . -B build` puts it in build/. colcon builds from a workspace
+# outside this repository, but run from in here by mistake it would create
+# build/, install/ and log/ at the root.
 # ---------------------------------------------------------------------------
 /build/
 /install/
 /log/
-
-# The same three can appear nested when colcon is run from inside a package
-# directory instead of the workspace root. They are still build output.
-**/build/
-**/install/
-**/log/
 
 # ---------------------------------------------------------------------------
 # Generated CANopen configuration

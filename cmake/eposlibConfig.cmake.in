@@ -1,0 +1,26 @@
+@PACKAGE_INIT@
+
+# ---------------------------------------------------------------------------
+# find_package(eposlib) gives two targets:
+#
+#   eposlib::eposlib   the device API (CanBus, Epos4, ...). Link this one.
+#   eposlib::core      the pure CiA 402 logic alone, without Lely.
+#
+#   find_package(eposlib 0.1 REQUIRED)
+#   target_link_libraries(my_robot PRIVATE eposlib::eposlib)
+#
+# and eposlib_generate_dcf(), to turn a robot's own bus.yml into the master
+# DCF at build time.
+# ---------------------------------------------------------------------------
+
+include(${CMAKE_CURRENT_LIST_DIR}/eposlibDependencies.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/eposlibTargets.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/eposlibGenerateDcf.cmake)
+
+# The units header is found again here rather than recorded at build time,
+# so the installed package does not carry a path from the machine it was
+# built on.
+set_property(TARGET eposlib::core APPEND PROPERTY
+  INTERFACE_INCLUDE_DIRECTORIES ${EPOSLIB_UNITS_INCLUDE_DIR})
+
+check_required_components(eposlib)
