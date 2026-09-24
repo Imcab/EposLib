@@ -165,3 +165,59 @@ Encoder::GetMainSensorResolution()
 }
 
 }  // namespace epos4
+
+namespace epos4
+{
+
+void
+Encoder::SetMechanism(std::uint32_t quadCountsPerRevolution, double gearRatio)
+{
+  converter_ = MechanismScale{quadCountsPerRevolution, gearRatio};
+}
+
+std::error_code
+Encoder::SetMechanismFromDevice(double gearRatio)
+{
+  auto & resolution = GetMainSensorResolution();
+  resolution.Refresh();
+  if (resolution.GetStatus()) {
+    return resolution.GetStatus();
+  }
+  if (resolution.GetValue() == 0) {
+    // The drive reports zero until the encoder has been configured. Taking it
+    // would make every later conversion divide by zero.
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  converter_ = MechanismScale{resolution.GetValue(), gearRatio};
+  return {};
+}
+
+std::optional<units::angle::turn_t>
+Encoder::GetAngle()
+{
+  if (!converter_.IsValid()) {
+    return std::nullopt;
+  }
+  auto & position = GetPosition();
+  position.Refresh();
+  if (position.GetStatus()) {
+    return std::nullopt;
+  }
+  return converter_.ToAngle(position.GetValue());
+}
+
+std::optional<units::angular_velocity::revolutions_per_minute_t>
+Encoder::GetAngularVelocity()
+{
+  if (!converter_.IsValid()) {
+    return std::nullopt;
+  }
+  auto & velocity = GetVelocity();
+  velocity.Refresh();
+  if (velocity.GetStatus()) {
+    return std::nullopt;
+  }
+  return converter_.ToAngularVelocity(velocity.GetValue());
+}
+
+}  // namespace epos4

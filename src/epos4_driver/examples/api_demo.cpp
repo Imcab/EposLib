@@ -12,9 +12,12 @@
 #include <string>
 #include <thread>
 
+#include <units.h>
+
 #include "epos4/hardware/Epos4.hpp"
 
 using namespace std::chrono_literals;
+using namespace units::literals;  // NOLINT(build/namespaces)
 
 int
 main(int argc, char ** argv)
@@ -53,6 +56,11 @@ main(int argc, char ** argv)
   //
   // Only the fields set here are written. Everything else on the drive is
   // left exactly as it was, so this cannot wipe tuned gains.
+  // Tell the driver what the mechanism is, so commands and feedback can be
+  // expressed in real units instead of encoder counts.
+  // 500 CPR quadrature encoder (2000 counts per motor turn), 1:100 reduction.
+  motor.SetMechanism(2000, 1.0 / 100.0);
+
   epos4::configs::Epos4Configuration config;
   config.motionProfile.profileVelocity = 2000;
   config.motionProfile.profileAcceleration = 10000;
@@ -92,11 +100,16 @@ main(int argc, char ** argv)
 
   // ---- move ----
   printf("\ncommanding a profile position move\n");
+  // Both forms work. This one is in real units at the joint:
   auto ec = motor.SetControl(
     epos4::controls::ProfilePosition{}
-    .WithPosition(50000)
-    .WithVelocity(1500)
+    .WithPosition(units::angle::degree_t{90.0})
+    .WithVelocity(15_rpm)
     .WithAcceleration(8000));
+
+  // The equivalent in raw drive units, which is what EPOS Studio and the
+  // manual speak:
+  //   .WithPosition(50000).WithVelocity(1500u)
 
   if (ec) {
     printf("move rejected: %s\n", ec.message().c_str());

@@ -15,10 +15,13 @@
   <depend>std_msgs</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
-  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
+
+  <!-- Schema order: the group membership goes after every *_depend and
+       before <export>, or xmllint rejects the manifest. -->
+  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>
     <build_type>ament_cmake</build_type>

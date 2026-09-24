@@ -7,6 +7,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(lely_core_libraries REQUIRED)
+find_package(robot_units REQUIRED)
 
 # ---------------------------------------------------------------------------
 # The library.
@@ -34,6 +35,7 @@ target_include_directories(epos4_core PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 target_compile_features(epos4_core PUBLIC cxx_std_17)
+ament_target_dependencies(epos4_core robot_units)
 
 add_library(${PROJECT_NAME} SHARED
   src/CanBus.cpp
@@ -46,7 +48,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 )
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 target_link_libraries(${PROJECT_NAME} epos4_core)
-ament_target_dependencies(${PROJECT_NAME} lely_core_libraries)
+ament_target_dependencies(${PROJECT_NAME} lely_core_libraries robot_units)
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -89,7 +91,7 @@ install(DIRECTORY include/ DESTINATION include)
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
-ament_export_dependencies(lely_core_libraries)
+ament_export_dependencies(lely_core_libraries robot_units)
 
 if(BUILD_TESTING)
   # Linters are pointed at the source directories explicitly rather than
@@ -125,6 +127,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_configs test/test_configs.cpp)
   target_link_libraries(test_configs epos4_core)
+
+  ament_add_gtest(test_unit_conversion test/test_unit_conversion.cpp)
+  target_link_libraries(test_unit_conversion epos4_core)
+
+  ament_add_gtest(test_digital_inputs test/test_digital_inputs.cpp)
+  target_link_libraries(test_digital_inputs epos4_core)
 
   ament_add_gtest(test_encoder_configs test/test_encoder_configs.cpp)
   target_link_libraries(test_encoder_configs ${PROJECT_NAME})

@@ -177,6 +177,31 @@ MotionProfileConfigs::AppendTo(ConfigWrites & out) const
 }
 
 void
+SiUnitConfigs::AppendTo(ConfigWrites & out) const
+{
+  if (!velocityPrefix) {
+    return;
+  }
+  // Table 6-160: prefix in bits 31..24, numerator 23..16, denominator 15..8.
+  // The unit is rev/min, so numerator 0xB4 (revolutions) over denominator
+  // 0x47 (minute) - and those two never change on this device.
+  constexpr std::uint32_t kRevPerMin = 0x00B44700u;
+  const std::uint32_t value =
+    (static_cast<std::uint32_t>(*velocityPrefix) << 24) | kRevPerMin;
+  out.push_back(ConfigWrite{od::At(od::cia402::kSIUnitVelocity), value});
+}
+
+void
+CyclicConfigs::AppendTo(ConfigWrites & out) const
+{
+  // Sub-index 1 only. Sub-index 2 (the time index) is fixed at -3 by the
+  // device, so the unit is always milliseconds and there is nothing to write.
+  Put<std::uint8_t, std::uint8_t>(
+    out, od::cia402::kInterpolationTimePeriod_InterpolationTimePeriodValue,
+    interpolationTimePeriodMs);
+}
+
+void
 LimitConfigs::AppendTo(ConfigWrites & out) const
 {
   Put<std::int32_t, std::int32_t>(
@@ -233,9 +258,9 @@ StopOptionConfigs::AppendTo(ConfigWrites & out) const
   PutEnum<signals::FaultReactionOption, std::int16_t>(
     out,
     od::At(od::cia402::kFaultReactionOptionCode), faultReaction);
-  Put<std::int16_t, std::int16_t>(
-    out, od::At(
-      od::cia402::kAbortConnectionOptionCode), abortConnectionOption);
+  PutEnum<signals::AbortConnectionOption, std::int16_t>(
+    out,
+    od::At(od::cia402::kAbortConnectionOptionCode), abortConnectionOption);
 }
 
 void
@@ -263,6 +288,48 @@ StandstillConfigs::AppendTo(ConfigWrites & out) const
     out, od::maxon::kStandstillWindowConfiguration_StandstillWindowTime, windowTimeMs);
   Put<std::uint16_t, std::uint16_t>(
     out, od::maxon::kStandstillWindowConfiguration_StandstillWindowTimeout, windowTimeoutMs);
+}
+
+std::error_code
+DigitalInputConfigs::Validate() const
+{
+  const std::optional<signals::DigitalInputFunction> pins[] = {
+    input1, input2, input3, input4,
+    highSpeedInput1, highSpeedInput2, highSpeedInput3, highSpeedInput4};
+
+  // "Each function can only be mapped once". kNone is exempt: several inputs
+  // may legitimately carry no function.
+  for (std::size_t i = 0; i < 8; ++i) {
+    if (!pins[i] || *pins[i] == signals::DigitalInputFunction::kNone) {
+      continue;
+    }
+    for (std::size_t j = i + 1; j < 8; ++j) {
+      if (pins[j] && *pins[j] == *pins[i]) {
+        return std::make_error_code(std::errc::invalid_argument);
+      }
+    }
+  }
+  return {};
+}
+
+void
+DigitalInputConfigs::AppendTo(ConfigWrites & out) const
+{
+  // Polarity first: it decides how a pin's level is interpreted, so it should
+  // be in force before a function starts acting on that pin.
+  Put<std::uint16_t, std::uint16_t>(
+    out, od::maxon::kDigitalInputProperties_DigitalInputsPolarity, polarity);
+
+  const std::optional<signals::DigitalInputFunction> pins[] = {
+    input1, input2, input3, input4,
+    highSpeedInput1, highSpeedInput2, highSpeedInput3, highSpeedInput4};
+
+  for (std::uint8_t i = 0; i < 8; ++i) {
+    PutEnum<signals::DigitalInputFunction, std::uint8_t>(
+      out, od::At(
+        od::maxon::kConfigurationOfDigitalInputs,
+        static_cast<std::uint8_t>(i + 1)), pins[i]);
+  }
 }
 
 void
@@ -294,6 +361,8 @@ Epos4Configuration::ToWrites() const
   velocityControl.AppendTo(out);
   positionControl.AppendTo(out);
   motionProfile.AppendTo(out);
+  siUnits.AppendTo(out);
+  cyclic.AppendTo(out);
   homing.AppendTo(out);
   stopOptions.AppendTo(out);
 
@@ -303,6 +372,7 @@ Epos4Configuration::ToWrites() const
   // place before anything can drive a brake pin.
   standstill.AppendTo(out);
   holdingBrake.AppendTo(out);
+  digitalInputs.AppendTo(out);
   digitalOutputs.AppendTo(out);
 
   limits.AppendTo(out);

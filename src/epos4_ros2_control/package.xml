@@ -22,14 +22,15 @@
   <!-- Our own library. The arrow points this way and only this way. -->
   <depend>epos4_driver</depend>
 
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_uncrustify</test_depend>
+  <test_depend>ament_cmake_lint_cmake</test_depend>
+  <test_depend>ament_cmake_xmllint</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
-    <!-- PHASE 4: pluginlib needs this export to find the class. Without it
-         the build succeeds but it fails at run time with "class not found".
+    <!-- pluginlib needs this export to find the class. Without it the build
+         succeeds and it fails at run time with "class not found". -->
     <hardware_interface plugin="${prefix}/epos4_ros2_control_plugin.xml"/>
-    -->
   </export>
 </package>

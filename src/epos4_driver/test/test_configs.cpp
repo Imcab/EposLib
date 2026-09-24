@@ -201,3 +201,145 @@ TEST(StandstillConfigs, MapToTheDocumentedSubIndices)
   EXPECT_EQ(writes[1].entry.subindex, 2);
   EXPECT_EQ(writes[2].entry.subindex, 3);
 }
+
+// ---------------------------------------------------------------------------
+// Stop option codes
+//
+// These pin each enum to the value range its table gives. They exist because
+// QuickStopOption originally carried two values the EPOS4 does not implement:
+// writing them aborts with 0x06090030 "Value range error", and since Apply()
+// stops at the first failure, everything after it silently never landed.
+// ---------------------------------------------------------------------------
+
+// Table 6-149: the manual gives the range as "6 to 6". One value, no choice.
+TEST(StopOptions, QuickStopHasExactlyOneValue)
+{
+  EXPECT_EQ(
+    static_cast<std::int16_t>(QuickStopOption::kSlowDownOnQuickStopRampAndStayInQuickStop),
+    6);
+
+  StopOptionConfigs stops;
+  stops.quickStop = QuickStopOption::kSlowDownOnQuickStopRampAndStayInQuickStop;
+  ConfigWrites writes;
+  stops.AppendTo(writes);
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_EQ(writes[0].entry.index, 0x605A);
+  EXPECT_EQ(std::get<std::int16_t>(writes[0].value), 6);
+}
+
+// Table 6-150 and Table 6-151: both are 0 or 1.
+TEST(StopOptions, ShutdownAndDisableOperationAreZeroOrOne)
+{
+  EXPECT_EQ(static_cast<std::int16_t>(ShutdownOption::kDisableDrive), 0);
+  EXPECT_EQ(static_cast<std::int16_t>(ShutdownOption::kSlowDownOnSlowDownRamp), 1);
+  EXPECT_EQ(static_cast<std::int16_t>(DisableOperationOption::kDisableDrive), 0);
+  EXPECT_EQ(static_cast<std::int16_t>(DisableOperationOption::kSlowDownOnSlowDownRamp), 1);
+}
+
+// Table 6-153: 0, 1 and 2. Value 1 was missing, and it is the useful middle
+// one - ramp down normally on a fault instead of braking hard, which on a
+// loaded arm is the difference between a controlled stop and a jolt.
+TEST(StopOptions, FaultReactionHasAllThreeValuesIncludingTheMiddleOne)
+{
+  EXPECT_EQ(static_cast<std::int16_t>(FaultReactionOption::kDisableDrive), 0);
+  EXPECT_EQ(static_cast<std::int16_t>(FaultReactionOption::kSlowDownOnSlowDownRamp), 1);
+  EXPECT_EQ(static_cast<std::int16_t>(FaultReactionOption::kSlowDownOnQuickStopRamp), 2);
+}
+
+// Table 6-146: only 2 and 3. This is what the drive does when the bus goes
+// away, so a value it rejects means no configured reaction at all.
+TEST(StopOptions, AbortConnectionIsTwoOrThree)
+{
+  EXPECT_EQ(static_cast<std::int16_t>(AbortConnectionOption::kDisableVoltage), 2);
+  EXPECT_EQ(static_cast<std::int16_t>(AbortConnectionOption::kSlowDownOnQuickStopRamp), 3);
+
+  StopOptionConfigs stops;
+  stops.abortConnectionOption = AbortConnectionOption::kSlowDownOnQuickStopRamp;
+  ConfigWrites writes;
+  stops.AppendTo(writes);
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_EQ(writes[0].entry.index, 0x6007);
+  EXPECT_EQ(std::get<std::int16_t>(writes[0].value), 3);
+}
+
+TEST(StopOptions, AllFourCodesTargetTheirOwnObject)
+{
+  StopOptionConfigs stops;
+  stops.quickStop = QuickStopOption::kSlowDownOnQuickStopRampAndStayInQuickStop;
+  stops.shutdown = ShutdownOption::kSlowDownOnSlowDownRamp;
+  stops.disableOperation = DisableOperationOption::kDisableDrive;
+  stops.faultReaction = FaultReactionOption::kSlowDownOnSlowDownRamp;
+  stops.abortConnectionOption = AbortConnectionOption::kDisableVoltage;
+
+  ConfigWrites writes;
+  stops.AppendTo(writes);
+  ASSERT_EQ(writes.size(), 5u);
+  EXPECT_NE(IndexOf(writes, Key(0x605A)), -1);
+  EXPECT_NE(IndexOf(writes, Key(0x605B)), -1);
+  EXPECT_NE(IndexOf(writes, Key(0x605C)), -1);
+  EXPECT_NE(IndexOf(writes, Key(0x605E)), -1);
+  EXPECT_NE(IndexOf(writes, Key(0x6007)), -1);
+
+  // 0x605D, the halt option code, is documented in the manual but absent from
+  // the EPOS4 Module 50/15 EDS, so nothing here must ever write it.
+  EXPECT_EQ(IndexOf(writes, Key(0x605D)), -1);
+}
+
+// ---------------------------------------------------------------------------
+// Cyclic modes, 0x60C2
+// ---------------------------------------------------------------------------
+
+TEST(CyclicConfig, WritesOnlyThePeriodValueNotTheTimeIndex)
+{
+  CyclicConfigs cyclic;
+  cyclic.interpolationTimePeriodMs = 10;
+
+  ConfigWrites writes;
+  cyclic.AppendTo(writes);
+
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_EQ(writes[0].entry.index, 0x60C2);
+  EXPECT_EQ(writes[0].entry.subindex, 1);
+  EXPECT_EQ(std::get<std::uint8_t>(writes[0].value), 10u);
+
+  // Sub-index 2 is fixed at -3 by the device (range -3 to -3), so writing it
+  // can only ever be an opportunity to get it wrong.
+  EXPECT_EQ(IndexOf(writes, Key(0x60C2, 2)), -1);
+}
+
+TEST(CyclicConfig, UnsetWritesNothing)
+{
+  CyclicConfigs cyclic;
+  ConfigWrites writes;
+  cyclic.AppendTo(writes);
+  EXPECT_TRUE(writes.empty());
+}
+
+// The value has to match the master's SYNC period. bus.yml uses microseconds
+// and 0x60C2 uses milliseconds, which is exactly the kind of mismatch that
+// produces stepping motion and no error message.
+TEST(CyclicConfig, TenMillisecondsMatchesASyncPeriodOfTenThousandMicroseconds)
+{
+  constexpr std::uint32_t kSyncPeriodMicroseconds = 10000;  // from bus.yml
+  constexpr std::uint8_t kExpectedPeriodMs = kSyncPeriodMicroseconds / 1000;
+
+  CyclicConfigs cyclic;
+  cyclic.interpolationTimePeriodMs = kExpectedPeriodMs;
+
+  ConfigWrites writes;
+  cyclic.AppendTo(writes);
+  EXPECT_EQ(std::get<std::uint8_t>(writes[0].value), 10u);
+}
+
+TEST(CyclicConfig, IsSeparateFromTheProfileGroup)
+{
+  // Setting the cyclic period must not emit any of the PPM/PVM profile
+  // objects, and vice versa: they configure different modes.
+  Epos4Configuration config;
+  config.cyclic.interpolationTimePeriodMs = 10;
+
+  const auto writes = config.ToWrites();
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_EQ(IndexOf(writes, Key(0x6081)), -1);
+  EXPECT_EQ(IndexOf(writes, Key(0x6083)), -1);
+}

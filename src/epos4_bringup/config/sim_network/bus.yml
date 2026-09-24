@@ -41,6 +41,15 @@ master:
   #
   # Set to 0 to disable SYNC entirely; the profiled modes (PPM, PVM) do not
   # need it, only the cyclic ones do.
+  #
+  # KEEP IN STEP WITH «Interpolation time period» (0x60C2:01), which the
+  # driver sets through configs::CyclicConfigs::interpolationTimePeriodMs.
+  # That object is in MILLISECONDS and this one in MICROSECONDS, so
+  # sync_period: 10000 here means interpolationTimePeriodMs = 10 there.
+  #
+  # If they disagree the drive interpolates over a window that is not the one
+  # setpoints actually arrive on: too small and the motion steps, too large
+  # and it lags the commanded trajectory. Neither fails loudly.
   sync_period: 10000
 
 node_2:

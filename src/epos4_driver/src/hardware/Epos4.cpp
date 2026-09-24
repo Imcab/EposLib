@@ -101,14 +101,72 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // so the same code works whether or not the DCF happens to map anything.
   // -------------------------------------------------------------------------
 
+  // Runs on the bus thread every time an inbound PDO updates a mapped object.
+  // Everything it does is a relaxed atomic store, so the control thread can
+  // read the values without locking, waiting or hopping threads.
   void OnRpdoWrite(std::uint16_t idx, std::uint8_t subidx) noexcept override
   {
     pdoActive.store(true, std::memory_order_relaxed);
     lastPdo.store(
       std::chrono::steady_clock::now().time_since_epoch().count(),
       std::memory_order_relaxed);
-    (void)idx;
-    (void)subidx;
+
+    if (subidx != 0) {
+      return;
+    }
+    // rpdo_mapped[idx][sub] converts implicitly on assignment, so the target
+    // variable's type is what selects the width. Getting it wrong here would
+    // silently truncate a position.
+    try {
+      switch (idx) {
+        case od::cia402::kStatusword: {
+            const std::uint16_t value = rpdo_mapped[idx][0];
+            cachedStatusword.store(value, std::memory_order_relaxed);
+            break;
+          }
+        case od::cia402::kPositionActualValue: {
+            const std::int32_t value = rpdo_mapped[idx][0];
+            cachedPosition.store(value, std::memory_order_relaxed);
+            break;
+          }
+        case od::cia402::kVelocityActualValue: {
+            const std::int32_t value = rpdo_mapped[idx][0];
+            cachedVelocity.store(value, std::memory_order_relaxed);
+            break;
+          }
+        case od::cia402::kTorqueActualValue: {
+            const std::int16_t value = rpdo_mapped[idx][0];
+            cachedTorque.store(value, std::memory_order_relaxed);
+            break;
+          }
+        default:
+          break;
+      }
+    } catch (...) {
+      // A mapped object that is not really there. Leave the cache alone: a
+      // stale value is visible through IsCyclicHealthy(), an invented one
+      // would not be.
+    }
+  }
+
+  // Runs on the bus thread when the master transmits SYNC, which is exactly
+  // when the outbound PDO is about to go out. Publishing here means the
+  // setpoint the control loop staged rides this cycle rather than the next.
+  void OnSync(std::uint8_t, const time_point &) noexcept override
+  {
+    if (!cyclicActive.load(std::memory_order_relaxed)) {
+      return;
+    }
+    try {
+      tpdo_mapped[od::cia402::kControlword][0] =
+        cachedControlword.load(std::memory_order_relaxed);
+      tpdo_mapped[od::cia402::kTargetPosition][0] =
+        stagedPosition.load(std::memory_order_relaxed);
+    } catch (...) {
+      // Not mapped: nothing to publish. The cyclic path is only meaningful
+      // with a PDO mapping, and its absence shows up as IsCyclicHealthy()
+      // being false rather than as an exception crossing the bus thread.
+    }
   }
 
   // Reads a value the drive publishes over TPDO. Posted onto the driver's
@@ -186,6 +244,17 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   std::atomic<bool> pdoActive{false};
   std::atomic<long long> lastPdo{0};
 
+  // Written by the bus thread, read by the control thread.
+  std::atomic<std::int32_t> cachedPosition{0};
+  std::atomic<std::int32_t> cachedVelocity{0};
+  std::atomic<std::int16_t> cachedTorque{0};
+  std::atomic<std::uint16_t> cachedStatusword{0};
+
+  // Written by the control thread, read by the bus thread on SYNC.
+  std::atomic<std::int32_t> stagedPosition{0};
+  std::atomic<std::uint16_t> cachedControlword{0};
+  std::atomic<bool> cyclicActive{false};
+
   // Makes sure the drive is in the mode a control request needs. Writing
   // 0x6060 only asks; the manual recommends confirming with 0x6061, because a
   // mode change the drive refused would otherwise go unnoticed and every
@@ -233,6 +302,9 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   signals::StatusSignal<bool> internalLimit;
   signals::StatusSignal<bool> warning;
   signals::StatusSignal<signals::BrakeState> brakeState;
+  signals::StatusSignal<std::uint32_t> digitalInputs;
+  signals::StatusSignal<std::uint32_t> motorRatedTorque;
+  signals::StatusSignal<std::uint16_t> digitalInputPins;
 
   std::unique_ptr<Configurator> configurator;
   std::unique_ptr<Encoder> encoder;
@@ -313,15 +385,31 @@ EPOS4_APPLY_GROUP(StopOptionConfigs)
 EPOS4_APPLY_GROUP(HoldingBrakeConfigs)
 EPOS4_APPLY_GROUP(StandstillConfigs)
 EPOS4_APPLY_GROUP(DigitalOutputConfigs)
+EPOS4_APPLY_GROUP(CyclicConfigs)
 
 #undef EPOS4_APPLY_GROUP
+
+std::error_code
+Configurator::Apply(const configs::DigitalInputConfigs & config)
+{
+  // Checked here rather than inside AppendTo so the caller learns the mapping
+  // is wrong before a single write reaches the bus.
+  if (auto ec = config.Validate()) {
+    return ec;
+  }
+  configs::ConfigWrites writes;
+  config.AppendTo(writes);
+  return ApplyWrites(writes);
+}
 
 std::error_code
 Configurator::Save()
 {
   // 0x1010:01, signature "save" as little-endian ASCII. Section 6.2.6.
   constexpr std::uint32_t kSaveSignature = 0x65766173;  // 's','a','v','e'
-  return device_.impl_->Write<std::uint32_t>(od::At(0x1010, 1), kSaveSignature);
+  return device_.impl_->Write<std::uint32_t>(
+    od::comm::kStoreParameters_SaveAllParameters,
+    kSaveSignature);
 }
 
 std::error_code
@@ -329,7 +417,8 @@ Configurator::RestoreDefaults()
 {
   // 0x1011:01, signature "load". Section 6.2.7. Takes effect after a reset.
   constexpr std::uint32_t kLoadSignature = 0x64616F6C;  // 'l','o','a','d'
-  return device_.impl_->Write<std::uint32_t>(od::At(0x1011, 1), kLoadSignature);
+  return device_.impl_->Write<std::uint32_t>(
+    od::comm::kRestoreDefaultParameters_RestoreAllDefaultParameters, kLoadSignature);
 }
 
 std::error_code
@@ -500,6 +589,22 @@ Epos4::Attach(lely_master_t & master)
   d.internalLimit = signals::StatusSignal<bool>(bit(signals::status_bits::kInternalLimit));
   d.warning = signals::StatusSignal<bool>(bit(signals::status_bits::kWarning));
 
+  d.motorRatedTorque = signals::StatusSignal<std::uint32_t>(
+    [&d](std::uint32_t & out) {
+      return d.Read<std::uint32_t>(od::At(od::cia402::kMotorRatedTorque), out);
+    });
+
+  d.digitalInputs = signals::StatusSignal<std::uint32_t>(
+    [&d](std::uint32_t & out) {
+      return d.ReadPreferPdo<std::uint32_t>(od::At(od::cia402::kDigitalInputs), out);
+    });
+
+  d.digitalInputPins = signals::StatusSignal<std::uint16_t>(
+    [&d](std::uint16_t & out) {
+      return d.Read<std::uint16_t>(
+        od::maxon::kDigitalInputProperties_DigitalInputsLogicState, out);
+    });
+
   d.brakeState = signals::StatusSignal<signals::BrakeState>(
     [&d](signals::BrakeState & out) -> std::error_code {
       std::uint8_t raw{};
@@ -528,6 +633,18 @@ Encoder &
 Epos4::GetEncoder()
 {
   return *impl_->encoder;
+}
+
+void
+Epos4::SetMechanism(std::uint32_t quadCountsPerRevolution, double gearRatio)
+{
+  impl_->encoder->SetMechanism(quadCountsPerRevolution, gearRatio);
+}
+
+const MechanismScale &
+Epos4::GetMechanism() const
+{
+  return impl_->encoder->GetMechanism();
 }
 
 // ---------------------------------------------------------------------------
@@ -708,11 +825,23 @@ Epos4::SetControl(const controls::ProfilePosition & request)
 
   if (auto ec = d.EnsureMode(controls::ProfilePosition::kMode)) {return ec;}
 
+  // Resolve the setpoints first. A request expressed in real units against a
+  // device whose mechanism was never configured is rejected here, before the
+  // mode has been changed or anything has been written.
+  std::int32_t targetCounts{};
+  if (!Resolve(request.position, GetMechanism(), targetCounts)) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+
   // Profile overrides, only when the request carries them. A caller who set
   // these once through MotionProfileConfigs does not pay for them per move.
   if (request.velocity) {
+    std::uint32_t rpm{};
+    if (!Resolve(*request.velocity, GetMechanism(), rpm)) {
+      return std::make_error_code(std::errc::invalid_argument);
+    }
     if (auto ec = d.Write<std::uint32_t>(
-        od::At(od::cia402::kProfileVelocity), *request.velocity)) {return ec;}
+        od::At(od::cia402::kProfileVelocity), rpm)) {return ec;}
   }
   if (request.acceleration) {
     if (auto ec = d.Write<std::uint32_t>(
@@ -724,7 +853,7 @@ Epos4::SetControl(const controls::ProfilePosition & request)
   }
 
   if (auto ec = d.Write<std::int32_t>(
-      od::At(od::cia402::kTargetPosition), request.position)) {return ec;}
+      od::At(od::cia402::kTargetPosition), targetCounts)) {return ec;}
 
   // Mode bits, before the handshake so they are in force when the setpoint is
   // taken. These never touch the state machine bits: SetModeBits filters.
@@ -776,6 +905,11 @@ Epos4::SetControl(const controls::ProfileVelocity & request)
 
   if (auto ec = d.EnsureMode(controls::ProfileVelocity::kMode)) {return ec;}
 
+  std::int32_t targetRpm{};
+  if (!Resolve(request.velocity, GetMechanism(), targetRpm)) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+
   if (request.acceleration) {
     if (auto ec = d.Write<std::uint32_t>(
         od::At(od::cia402::kProfileAcceleration), *request.acceleration)) {return ec;}
@@ -786,13 +920,10 @@ Epos4::SetControl(const controls::ProfileVelocity & request)
   }
 
   // PVM has no setpoint handshake: the target velocity takes effect as soon
-  // as it is written.
-  // The cyclic modes exist to be commanded every cycle. Staging the setpoint
-  // in the RPDO lets it ride the next SYNC instead of costing an SDO round
-  // trip per update.
-  const od::Entry target = od::At(od::cia402::kTargetVelocity);
-  if (auto ec = d.WriteMapped<std::int32_t>(target, request.velocity); !ec) {return {};}
-  return d.Write<std::int32_t>(target, request.velocity);
+  // as it is written. And no PDO path either - a profiled move is commanded
+  // once and the drive generates the ramp, so there is nothing cyclic to
+  // stage. That belongs to CyclicVelocity below.
+  return d.Write<std::int32_t>(od::At(od::cia402::kTargetVelocity), targetRpm);
 }
 
 std::error_code
@@ -801,6 +932,11 @@ Epos4::SetControl(const controls::CyclicPosition & request)
   auto & d = *impl_;
 
   if (auto ec = d.EnsureMode(controls::CyclicPosition::kMode)) {return ec;}
+
+  std::int32_t targetCounts{};
+  if (!Resolve(request.position, GetMechanism(), targetCounts)) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
 
   if (request.positionOffset) {
     if (auto ec = d.Write<std::int32_t>(
@@ -814,8 +950,8 @@ Epos4::SetControl(const controls::CyclicPosition & request)
   // in the RPDO lets it ride the next SYNC instead of costing an SDO round
   // trip per update.
   const od::Entry target = od::At(od::cia402::kTargetPosition);
-  if (auto ec = d.WriteMapped<std::int32_t>(target, request.position); !ec) {return {};}
-  return d.Write<std::int32_t>(target, request.position);
+  if (auto ec = d.WriteMapped<std::int32_t>(target, targetCounts); !ec) {return {};}
+  return d.Write<std::int32_t>(target, targetCounts);
 }
 
 std::error_code
@@ -825,6 +961,11 @@ Epos4::SetControl(const controls::CyclicVelocity & request)
 
   if (auto ec = d.EnsureMode(controls::CyclicVelocity::kMode)) {return ec;}
 
+  std::int32_t targetRpm{};
+  if (!Resolve(request.velocity, GetMechanism(), targetRpm)) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+
   if (request.velocityOffset) {
     if (auto ec = d.Write<std::int32_t>(
         od::At(od::cia402::kVelocityOffset), *request.velocityOffset)) {return ec;}
@@ -833,7 +974,12 @@ Epos4::SetControl(const controls::CyclicVelocity & request)
     if (auto ec = d.Write<std::int16_t>(
         od::At(od::cia402::kTorqueOffset), *request.torqueOffset)) {return ec;}
   }
-  return d.Write<std::int32_t>(od::At(od::cia402::kTargetVelocity), request.velocity);
+  // The cyclic modes exist to be commanded every cycle. Staging the setpoint
+  // in the RPDO lets it ride the next SYNC instead of costing an SDO round
+  // trip per update.
+  const od::Entry target = od::At(od::cia402::kTargetVelocity);
+  if (auto ec = d.WriteMapped<std::int32_t>(target, targetRpm); !ec) {return {};}
+  return d.Write<std::int32_t>(target, targetRpm);
 }
 
 std::error_code
@@ -869,6 +1015,32 @@ Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
   if (d.EnsureMode(controls::Homing::kMode)) {return false;}
 
   if (request.method) {
+    // Check the switch BEFORE anything moves. A homing run whose switch is
+    // not mapped in 0x3142 does not fail fast: the axis drives until it hits
+    // something mechanical or the timeout expires, which on an arm means
+    // finding the end stop with the payload.
+    if (const auto required = signals::RequiredInput(*request.method)) {
+      std::uint32_t mapped{};
+      if (d.Read<std::uint32_t>(od::At(od::cia402::kDigitalInputs), mapped) == std::error_code{}) {
+        // 0x60FD only reports functions that are actually assigned to a pin,
+        // so an unmapped function can never read as asserted. Confirm the
+        // mapping itself rather than the level.
+        bool assigned = false;
+        for (std::uint8_t sub = 1; sub <= 8 && !assigned; ++sub) {
+          std::uint8_t function{};
+          if (d.Read<std::uint8_t>(
+              od::At(od::maxon::kConfigurationOfDigitalInputs, sub), function) ==
+            std::error_code{})
+          {
+            assigned = (function == static_cast<std::uint8_t>(*required));
+          }
+        }
+        if (!assigned) {
+          return false;
+        }
+      }
+    }
+
     if (d.Write<std::int8_t>(
         od::At(od::cia402::kHomingMethod),
         static_cast<std::int8_t>(*request.method)))
@@ -933,6 +1105,15 @@ signals::StatusSignal<bool> & Epos4::IsHomingAttained() {return impl_->homingAtt
 signals::StatusSignal<bool> & Epos4::IsInternalLimitActive() {return impl_->internalLimit;}
 signals::StatusSignal<bool> & Epos4::HasWarning() {return impl_->warning;}
 signals::StatusSignal<signals::BrakeState> & Epos4::GetBrakeState() {return impl_->brakeState;}
+signals::StatusSignal<std::uint32_t> & Epos4::GetDigitalInputs() {return impl_->digitalInputs;}
+signals::StatusSignal<std::uint32_t> & Epos4::GetMotorRatedTorque()
+{
+  return impl_->motorRatedTorque;
+}
+signals::StatusSignal<std::uint16_t> & Epos4::GetDigitalInputPins()
+{
+  return impl_->digitalInputPins;
+}
 
 // ---------------------------------------------------------------------------
 // Raw object access
@@ -1062,6 +1243,195 @@ Epos4::SetEmergencyCallback(std::function<void(const signals::EmergencyMessage &
   }
   std::lock_guard<std::mutex> lock{impl_->emcyMutex};
   impl_->emcyCallback = std::move(callback);
+}
+
+}  // namespace epos4
+
+namespace epos4
+{
+
+bool
+Epos4::IsInputActive(signals::DigitalInputFunction function)
+{
+  if (function == signals::DigitalInputFunction::kNone) {
+    return false;
+  }
+
+  auto & signal = GetDigitalInputs();
+  signal.Refresh();
+  if (signal.GetStatus()) {
+    return false;
+  }
+
+  // The function's numeric value is its bit position in 0x60FD, which is why
+  // this works without a lookup table: the manual uses the same numbering for
+  // "what is assigned to this pin" and "which bit reports it".
+  const std::uint32_t mask = 1u << static_cast<std::uint8_t>(function);
+  return (signal.GetValue() & mask) != 0;
+}
+
+bool
+Epos4::IsNegativeLimitActive()
+{
+  // Both variants report on the same bit; the "without errors" one only
+  // differs in whether hitting it raises a fault outside homing.
+  return IsInputActive(signals::DigitalInputFunction::kNegativeLimitSwitch) ||
+         IsInputActive(signals::DigitalInputFunction::kNegativeLimitSwitchNoError);
+}
+
+bool
+Epos4::IsPositiveLimitActive()
+{
+  return IsInputActive(signals::DigitalInputFunction::kPositiveLimitSwitch) ||
+         IsInputActive(signals::DigitalInputFunction::kPositiveLimitSwitchNoError);
+}
+
+bool
+Epos4::IsHomeSwitchActive()
+{
+  return IsInputActive(signals::DigitalInputFunction::kHomeSwitch);
+}
+
+}  // namespace epos4
+
+namespace epos4
+{
+
+std::optional<std::int16_t>
+Epos4::TorqueToPerThousand(units::torque::newton_meter_t torque)
+{
+  auto & rated = GetMotorRatedTorque();
+  rated.Refresh();
+  if (rated.GetStatus() || rated.GetValue() == 0) {
+    // Zero rated torque means the motor data has not been configured.
+    // Returning 0 here would command no torque while looking like success.
+    return std::nullopt;
+  }
+
+  const double scaled = torque.value() * 1e9 / static_cast<double>(rated.GetValue());
+
+  // 0x6071 is an INTEGER16, so anything past the rails would wrap into a
+  // torque in the opposite direction.
+  if (scaled > 32767.0 || scaled < -32768.0) {
+    return std::nullopt;
+  }
+  return epos4::ToPerThousand(torque, rated.GetValue());
+}
+
+std::optional<units::torque::newton_meter_t>
+Epos4::PerThousandToTorque(std::int16_t perThousand)
+{
+  auto & rated = GetMotorRatedTorque();
+  rated.Refresh();
+  if (rated.GetStatus() || rated.GetValue() == 0) {
+    return std::nullopt;
+  }
+  return epos4::ToTorque(perThousand, rated.GetValue());
+}
+
+}  // namespace epos4
+
+namespace epos4
+{
+
+// ---------------------------------------------------------------------------
+// Cyclic path
+// ---------------------------------------------------------------------------
+
+std::error_code
+Epos4::EnterCyclicPositionMode()
+{
+  if (!impl_) {
+    return std::make_error_code(std::errc::not_connected);
+  }
+  auto & d = *impl_;
+
+  // The one SDO exchange of the whole cyclic path. Doing it here instead of
+  // per command is the difference between a control loop and a bus flood.
+  if (auto ec = d.EnsureMode(signals::OperationMode::kCyclicSynchronousPosition)) {
+    return ec;
+  }
+
+  // Seed the setpoint with where the axis actually is. Publishing a zero on
+  // the first SYNC would command a move to the origin, which on an arm is a
+  // swing across its whole range.
+  std::int32_t position{};
+  if (auto ec = d.Read<std::int32_t>(od::At(od::cia402::kPositionActualValue), position)) {
+    return ec;
+  }
+  d.stagedPosition.store(position, std::memory_order_relaxed);
+  d.cachedPosition.store(position, std::memory_order_relaxed);
+
+  // The Controlword published on every SYNC is whatever the state machine
+  // last built, so an axis that was enabled stays enabled.
+  d.cachedControlword.store(d.controlword.Raw(), std::memory_order_relaxed);
+
+  d.cyclicActive.store(true, std::memory_order_relaxed);
+  return {};
+}
+
+void
+Epos4::ExitCyclicMode()
+{
+  if (impl_) {
+    impl_->cyclicActive.store(false, std::memory_order_relaxed);
+  }
+}
+
+bool
+Epos4::IsCyclicModeActive() const
+{
+  return impl_ && impl_->cyclicActive.load(std::memory_order_relaxed);
+}
+
+std::int32_t
+Epos4::GetCachedPosition() const
+{
+  return impl_ ? impl_->cachedPosition.load(std::memory_order_relaxed) : 0;
+}
+
+std::int32_t
+Epos4::GetCachedVelocity() const
+{
+  return impl_ ? impl_->cachedVelocity.load(std::memory_order_relaxed) : 0;
+}
+
+std::int16_t
+Epos4::GetCachedTorque() const
+{
+  return impl_ ? impl_->cachedTorque.load(std::memory_order_relaxed) : 0;
+}
+
+std::uint16_t
+Epos4::GetCachedStatusword() const
+{
+  return impl_ ? impl_->cachedStatusword.load(std::memory_order_relaxed) : 0;
+}
+
+void
+Epos4::StageTargetPosition(std::int32_t quadCounts)
+{
+  if (impl_) {
+    impl_->stagedPosition.store(quadCounts, std::memory_order_relaxed);
+  }
+}
+
+bool
+Epos4::IsCyclicHealthy(std::chrono::steady_clock::duration maxAge) const
+{
+  if (!impl_ || !impl_->cyclicActive.load(std::memory_order_relaxed)) {
+    return false;
+  }
+
+  // Stale data is the failure this catches. When the bus goes quiet the
+  // cached values stop changing but keep reading back happily, so without an
+  // age check a controller would go on believing a dead axis is tracking.
+  if (GetTimeSinceLastPdo() > maxAge) {
+    return false;
+  }
+
+  const auto state = core::Decode(GetCachedStatusword());
+  return state && *state == signals::State::kOperationEnabled;
 }
 
 }  // namespace epos4

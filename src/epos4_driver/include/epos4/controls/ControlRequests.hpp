@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "epos4/core/Setpoint.hpp"
 #include "epos4/signals/Enums.hpp"
 
 namespace epos4::controls
@@ -19,6 +20,15 @@ namespace epos4::controls
 // Each request knows which mode it needs. Epos4::SetControl switches the
 // drive into that mode before commanding, and does nothing if it is already
 // there, so the caller never has to think about 0x6060.
+//
+// Setpoints take either raw drive units or physical quantities:
+//
+//   .WithPosition(50000)     quadcounts, what the manual and EPOS Studio use
+//   .WithPosition(90_deg)    an angle at the output shaft
+//
+// The quantity form needs the device's mechanism to have been configured
+// through Epos4::SetMechanism(); without it SetControl returns
+// std::errc::invalid_argument rather than guessing a resolution.
 // ---------------------------------------------------------------------------
 
 
@@ -31,11 +41,11 @@ namespace epos4::controls
 // a second move silently never happens.
 struct ProfilePosition
 {
-  std::int32_t position{0};  // 0x607A, [position units]
+  PositionSetpoint position{0};  // 0x607A
 
-  std::optional<std::uint32_t> velocity;      // 0x6081, overrides the config
-  std::optional<std::uint32_t> acceleration;  // 0x6083
-  std::optional<std::uint32_t> deceleration;  // 0x6084
+  std::optional<SpeedSetpoint> velocity;      // 0x6081, overrides the config
+  std::optional<std::uint32_t> acceleration;  // 0x6083, [rpm/s]
+  std::optional<std::uint32_t> deceleration;  // 0x6084, [rpm/s]
 
   // Controlword bit 6. Absolute is almost always what an arm wants: relative
   // moves accumulate whatever error the previous move left behind.
@@ -47,8 +57,8 @@ struct ProfilePosition
 
   static constexpr auto kMode = signals::OperationMode::kProfilePosition;
 
-  ProfilePosition & WithPosition(std::int32_t v) {position = v; return *this;}
-  ProfilePosition & WithVelocity(std::uint32_t v) {velocity = v; return *this;}
+  ProfilePosition & WithPosition(PositionSetpoint v) {position = v; return *this;}
+  ProfilePosition & WithVelocity(SpeedSetpoint v) {velocity = v; return *this;}
   ProfilePosition & WithAcceleration(std::uint32_t v) {acceleration = v; return *this;}
   ProfilePosition & WithDeceleration(std::uint32_t v) {deceleration = v; return *this;}
   ProfilePosition & WithRelative(bool v) {relative = v; return *this;}
@@ -59,14 +69,14 @@ struct ProfilePosition
 // Profile Velocity Mode, section 3.4 (p.3-25).
 struct ProfileVelocity
 {
-  std::int32_t velocity{0};  // 0x60FF, [velocity units]
+  VelocitySetpoint velocity{0};  // 0x60FF
 
-  std::optional<std::uint32_t> acceleration;  // 0x6083
-  std::optional<std::uint32_t> deceleration;  // 0x6084
+  std::optional<std::uint32_t> acceleration;  // 0x6083, [rpm/s]
+  std::optional<std::uint32_t> deceleration;  // 0x6084, [rpm/s]
 
   static constexpr auto kMode = signals::OperationMode::kProfileVelocity;
 
-  ProfileVelocity & WithVelocity(std::int32_t v) {velocity = v; return *this;}
+  ProfileVelocity & WithVelocity(VelocitySetpoint v) {velocity = v; return *this;}
   ProfileVelocity & WithAcceleration(std::uint32_t v) {acceleration = v; return *this;}
   ProfileVelocity & WithDeceleration(std::uint32_t v) {deceleration = v; return *this;}
 };
@@ -81,14 +91,14 @@ struct ProfileVelocity
 // PDO - sending it by SDO would be far slower than the cycle it assumes.
 struct CyclicPosition
 {
-  std::int32_t position{0};  // 0x607A
+  PositionSetpoint position{0};  // 0x607A
 
-  std::optional<std::int32_t> positionOffset;  // 0x60B0
+  std::optional<std::int32_t> positionOffset;  // 0x60B0, [quadcounts]
   std::optional<std::int16_t> torqueOffset;    // 0x60B2, feed forward
 
   static constexpr auto kMode = signals::OperationMode::kCyclicSynchronousPosition;
 
-  CyclicPosition & WithPosition(std::int32_t v) {position = v; return *this;}
+  CyclicPosition & WithPosition(PositionSetpoint v) {position = v; return *this;}
   CyclicPosition & WithPositionOffset(std::int32_t v) {positionOffset = v; return *this;}
   CyclicPosition & WithTorqueOffset(std::int16_t v) {torqueOffset = v; return *this;}
 };
@@ -97,14 +107,14 @@ struct CyclicPosition
 // Cyclic Synchronous Velocity Mode, section 3.7 (p.3-41).
 struct CyclicVelocity
 {
-  std::int32_t velocity{0};  // 0x60FF
+  VelocitySetpoint velocity{0};  // 0x60FF
 
   std::optional<std::int32_t> velocityOffset;  // 0x60B1
   std::optional<std::int16_t> torqueOffset;    // 0x60B2
 
   static constexpr auto kMode = signals::OperationMode::kCyclicSynchronousVelocity;
 
-  CyclicVelocity & WithVelocity(std::int32_t v) {velocity = v; return *this;}
+  CyclicVelocity & WithVelocity(VelocitySetpoint v) {velocity = v; return *this;}
   CyclicVelocity & WithVelocityOffset(std::int32_t v) {velocityOffset = v; return *this;}
   CyclicVelocity & WithTorqueOffset(std::int16_t v) {torqueOffset = v; return *this;}
 };

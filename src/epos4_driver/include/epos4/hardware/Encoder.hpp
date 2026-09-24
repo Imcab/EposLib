@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <system_error>
 
 #include "epos4/configs/EncoderConfigs.hpp"
+#include "epos4/core/UnitConversion.hpp"
 #include "epos4/signals/StatusSignal.hpp"
 
 namespace epos4
@@ -100,6 +102,44 @@ public:
   signals::StatusSignal<std::uint32_t> & GetMainSensorResolution();
 
   // -------------------------------------------------------------------------
+  // Feedback in real units
+  //
+  // The drive cannot do this: «SI unit position» (0x60A8) has exactly one
+  // legal value, increments, so 0x6064 is always quadcounts no matter how the
+  // factor group is configured. Turning that into an angle needs the encoder
+  // resolution and the gear ratio, which live here.
+  //
+  // SetMechanism() has to be called first. Until it is, the accessors below
+  // return nullopt rather than a plausible-looking wrong number - a joint
+  // angle that is silently out by the gear ratio is worse than no reading.
+  // -------------------------------------------------------------------------
+
+  // quadCountsPerRevolution is of the MOTOR shaft: four times the encoder's
+  // pulses per revolution. gearRatio is output turns per motor turn, so a
+  // 1:100 reduction is 1.0/100.0 and every angle below is at the joint.
+  void SetMechanism(std::uint32_t quadCountsPerRevolution, double gearRatio = 1.0);
+
+  // Reads the encoder resolution the drive computed (0x3000:05) and uses it,
+  // so the resolution does not have to be repeated in application code.
+  // The gear ratio still has to be supplied: the drive does not know it
+  // unless «Gear configuration» was set, and even then it does not apply it
+  // to the position it reports.
+  std::error_code SetMechanismFromDevice(double gearRatio = 1.0);
+
+  const MechanismScale & GetMechanism() const {return converter_;}
+
+  // Position and velocity as physical quantities. nullopt when the mechanism
+  // has not been set, or when the underlying read failed.
+  //
+  // The return types are nholthaus units, so they convert implicitly to any
+  // compatible unit:
+  //
+  //   units::angle::degree_t deg = *encoder.GetAngle();
+  //   double rad = units::angle::radian_t(*encoder.GetAngle()).value();
+  std::optional<units::angle::turn_t> GetAngle();
+  std::optional<units::angular_velocity::revolutions_per_minute_t> GetAngularVelocity();
+
+  // -------------------------------------------------------------------------
   // Unit helpers
   //
   // The conversion the manual states for incremental encoders:
@@ -133,6 +173,8 @@ private:
   signals::StatusSignal<std::uint16_t> hallPattern_;
   signals::StatusSignal<std::uint32_t> ssiRawPosition_;
   signals::StatusSignal<std::uint32_t> mainSensorResolution_;
+
+  MechanismScale converter_;
 };
 
 }  // namespace epos4

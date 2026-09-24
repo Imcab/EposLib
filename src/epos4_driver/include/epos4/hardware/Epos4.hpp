@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -17,6 +18,7 @@ using lely_master_t = lely::canopen::AsyncMaster;
 #include "epos4/configs/Configs.hpp"
 #include "epos4/controls/ControlRequests.hpp"
 #include "epos4/signals/Enums.hpp"
+#include "epos4/core/UnitConversion.hpp"
 #include "epos4/signals/Errors.hpp"
 #include "epos4/signals/StatusSignal.hpp"
 
@@ -57,6 +59,12 @@ public:
   std::error_code Apply(const configs::HoldingBrakeConfigs & config);
   std::error_code Apply(const configs::StandstillConfigs & config);
   std::error_code Apply(const configs::DigitalOutputConfigs & config);
+
+  // Validates the mapping before writing: the manual forbids the same
+  // function on two inputs, and a rejected write halfway through would leave
+  // limit switches half configured.
+  std::error_code Apply(const configs::DigitalInputConfigs & config);
+  std::error_code Apply(const configs::CyclicConfigs & config);
 
   // Reads the current configuration back out of the device.
   std::error_code Refresh(configs::Epos4Configuration & config);
@@ -116,6 +124,21 @@ public:
   // its own rule that nothing can be configured while the motor has power.
   Encoder & GetEncoder();
 
+  // Tells the driver how many encoder counts make a turn and what the gearbox
+  // does, which is what lets control requests and feedback be expressed in
+  // real units.
+  //
+  //   motor.SetMechanism(2000, 1.0 / 100.0);   // 500 CPR, 1:100 reduction
+  //   motor.SetControl(controls::ProfilePosition{}.WithPosition(90_deg));
+  //
+  // Without it, requests given in raw counts still work; requests given as
+  // quantities are rejected with std::errc::invalid_argument rather than
+  // being resolved against a guessed resolution.
+  //
+  // This is a shortcut to Encoder::SetMechanism(); the scale is shared.
+  void SetMechanism(std::uint32_t quadCountsPerRevolution, double gearRatio = 1.0);
+  const MechanismScale & GetMechanism() const;
+
   // -------------------------------------------------------------------------
   // State machine, section 2.2. The sequencing is bounded and non-blocking
   // internally: each call advances the drive by at most one transition per
@@ -148,6 +171,12 @@ public:
   // Stops motion while staying enabled (Controlword bit 8). Different from
   // QuickStop, which leaves the state machine, and from Disable, which cuts
   // power. How hard it stops is set by MotionProfileConfigs::profileDeceleration.
+  //
+  // NOTE: what Halt does is formally decided by «Halt option code» (0x605D,
+  // Table 6-152). That object is documented in the manual but is NOT present
+  // in the EDS of the EPOS4 Module 50/15, so it is not exposed here - adding
+  // a setter for an object the device does not implement would only produce
+  // aborts at run time. The behaviour is whatever the firmware ships with.
   std::error_code Halt();
 
   // Triggers the quick stop ramp (Controlword bit 2 driven low). The drive
@@ -190,6 +219,11 @@ public:
   // Starts a homing run and waits for it to finish. Homing takes seconds and
   // can fail on a limit switch that never triggers, hence the timeout and the
   // boolean rather than fire-and-forget.
+  //
+  // Before moving, the switch the method depends on is checked against the
+  // digital input mapping (0x3142). A method whose switch is not assigned to
+  // any pin returns false immediately instead of driving the axis into
+  // whatever it finds first. See signals::RequiredInput().
   bool Home(
     const controls::Homing & request,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{30000});
@@ -211,6 +245,26 @@ public:
   signals::StatusSignal<std::int32_t> & GetFollowingError();  // 0x60F4
   signals::StatusSignal<std::int16_t> & GetCurrentDemand();   // 0x30D0
 
+  // Motor rated torque, 0x6076 [uNm]. READ ONLY: the drive computes it as
+  // «Nominal current» x «Torque constant», both from MotorConfigs, and the
+  // manual states that "changing the value by write access is not permitted".
+  //
+  // It matters because CyclicTorque commands 0x6071 in THOUSANDTHS of this
+  // value. Without reading it, WithTorque(500) is a number with no physical
+  // meaning - nobody can tell whether it is 50 mNm or 5 Nm. Use the two
+  // converters below.
+  signals::StatusSignal<std::uint32_t> & GetMotorRatedTorque();
+
+  // Converts between real torque and the per-thousand units that 0x6071 and
+  // 0x6077 use. Both refresh the rated torque signal, so they touch the bus
+  // unless it has been read already.
+  //
+  // Return nullopt when the rated torque cannot be read or is zero, which
+  // means the motor data has not been configured yet: silently returning 0
+  // would command no torque and look like a working call.
+  std::optional<std::int16_t> TorqueToPerThousand(units::torque::newton_meter_t torque);
+  std::optional<units::torque::newton_meter_t> PerThousandToTorque(std::int16_t perThousand);
+
   // Error code of the most recent fault, 0x603F. Decode it with
   // signals::DescribeDeviceError, or use DescribeLastError() below.
   signals::StatusSignal<std::uint16_t> & GetErrorCode();
@@ -229,6 +283,33 @@ public:
   signals::StatusSignal<bool> & IsInternalLimitActive();  // bit 11
   signals::StatusSignal<bool> & HasWarning();           // bit 7
 
+  // -------------------------------------------------------------------------
+  // Digital inputs
+  //
+  // Two views of the same pins, and the difference matters:
+  //
+  //   GetDigitalInputs()      0x60FD, indexed BY FUNCTION and after polarity
+  //                           correction. Bit 0 is the negative limit switch
+  //                           whichever terminal it happens to be wired to.
+  //   GetDigitalInputPins()   0x3141:01, indexed BY PIN and before polarity
+  //                           correction. This is the one to look at when
+  //                           checking wiring, because it shows what the
+  //                           terminal actually sees.
+  // -------------------------------------------------------------------------
+  signals::StatusSignal<std::uint32_t> & GetDigitalInputs();
+  signals::StatusSignal<std::uint16_t> & GetDigitalInputPins();
+
+  // Whether a given function is currently asserted, read from 0x60FD.
+  // Refreshes the signal, so it costs a bus read unless PDOs are mapped.
+  bool IsInputActive(signals::DigitalInputFunction function);
+
+  // The three that homing depends on, by name. A limit switch that reads as
+  // asserted before a homing run started usually means the polarity is
+  // inverted, not that the axis is at the end stop.
+  bool IsNegativeLimitActive();
+  bool IsPositiveLimitActive();
+  bool IsHomeSwitchActive();
+
   // Holding brake state, 0x3158:03. Active means clamped and holding the
   // axis; inactive means released.
   //
@@ -243,6 +324,61 @@ public:
   // standstill interlock. That is an explicit choice to opt into, not the
   // default.
   signals::StatusSignal<signals::BrakeState> & GetBrakeState();
+
+  // -------------------------------------------------------------------------
+  // Cyclic path
+  //
+  // Everything else on this class does a thread hop and a blocking wait: a
+  // call posts onto the CANopen thread and waits on a future. That is fine
+  // for configuration and for moving to poses, and unusable in a control
+  // loop - at 500 Hz with six axes it is thousands of context switches a
+  // second, each one blocking the thread that must not block.
+  //
+  // The accessors below do none of that. Inbound PDOs land in atomics on the
+  // bus thread; setpoints are staged into atomics and published by the bus
+  // thread on the next SYNC. Reading and writing from the control loop is a
+  // relaxed atomic load or store, with no syscall and no waiting.
+  //
+  //     control thread                bus thread
+  //     ──────────────                ──────────
+  //     StageTargetPosition() ──────→ OnSync: atomics -> RPDO
+  //     GetCachedPosition()   ←────── OnRpdoWrite: TPDO -> atomics
+  // -------------------------------------------------------------------------
+
+  // Switches the drive into Cyclic Synchronous Position and starts publishing
+  // the staged setpoint on every SYNC.
+  //
+  // The mode is set ONCE here, not per command. SetControl() calls
+  // EnsureMode() every time, which costs an SDO read - two CAN frames and a
+  // round trip - and in a cyclic loop that is the whole budget.
+  //
+  // The drive must already be enabled: this does not walk the state machine.
+  std::error_code EnterCyclicPositionMode();
+
+  // Stops publishing. The drive keeps whatever mode it is in; use Disable()
+  // to remove power.
+  void ExitCyclicMode();
+
+  bool IsCyclicModeActive() const;
+
+  // Lock-free. Safe to call from a real-time loop.
+  std::int32_t GetCachedPosition() const;    // 0x6064 [quadcounts]
+  std::int32_t GetCachedVelocity() const;    // 0x606C [rpm]
+  std::int16_t GetCachedTorque() const;      // 0x6077 [per thousand of rated]
+  std::uint16_t GetCachedStatusword() const;  // 0x6041
+
+  // Stages the next target position. It goes out on the following SYNC.
+  // Lock-free, and safe to call from a different thread than the bus.
+  void StageTargetPosition(std::int32_t quadCounts);
+
+  // True while PDOs are arriving and the drive reports «Operation enabled».
+  //
+  // Worth checking every cycle: if the bus goes quiet the cached values stop
+  // changing but keep reading back happily, so a controller would go on
+  // believing a dead axis is tracking. maxAge is how long without a PDO
+  // counts as dead; at a 10 ms SYNC a few tens of milliseconds is generous.
+  bool IsCyclicHealthy(
+    std::chrono::steady_clock::duration maxAge = std::chrono::milliseconds{50}) const;
 
   // -------------------------------------------------------------------------
   // Diagnostics

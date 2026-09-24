@@ -212,10 +212,18 @@ private:
 
   sig::State state_{sig::State::kNotReadyToSwitchOn};
 
+  // --- Cyclic Synchronous Position Mode ---
+  //
+  // The drive does not generate a trajectory here: the master sends a new
+  // target every SYNC and the drive interpolates towards it over the
+  // interpolation time period (0x60C2). Modelled the same way.
+  bool cspFollowing_{false};
+
   // --- Profile Position Mode ---
   std::int32_t position_{0};
   std::int32_t target_{0};
   std::uint32_t profileVelocity_{1000};
+  std::int32_t interpolationMs_{10};
   bool moving_{false};
   bool setpointAcknowledged_{false};
   bool targetReached_{true};
@@ -268,6 +276,34 @@ private:
     }
   }
 
+  // CSP: take whatever the master last published and interpolate towards it.
+  //
+  // No setpoint handshake and no profile - that is the whole difference from
+  // PPM. The drive is a follower here, and the trajectory lives in the
+  // master.
+  void
+  HandleCsp()
+  {
+    const std::int32_t target = (*this)[0x607A][0];
+    if (target == target_ && cspFollowing_) {
+      return;
+    }
+    target_ = target;
+    cspFollowing_ = true;
+    moving_ = true;
+    targetReached_ = false;
+
+    // Interpolation time period (0x60C2:01) in milliseconds. Zero means the
+    // master did not configure it, and the manual says the drive then jumps
+    // to the new value within one control cycle - noisy, but modelled as
+    // written rather than smoothed over.
+    const std::uint8_t periodMs = (*this)[0x60C2][1];
+    interpolationMs_ = (periodMs == 0) ? 1 : periodMs;
+
+    PublishStatusword();
+    ArmMotion();
+  }
+
   // A crude but honest trapezoid-free ramp: step towards the target at the
   // profile velocity. Enough to exercise Target reached and the handshake;
   // not a claim to model the drive's real trajectory generator.
@@ -277,7 +313,14 @@ private:
     if (!moving_) {return;}
 
     constexpr std::int32_t kTickMs = 20;
+
+    // Under CSP the move is bounded by the interpolation period, not by a
+    // profile velocity: the drive has to arrive by the time the next setpoint
+    // is due.
     const std::int32_t stepSize =
+      cspFollowing_ ?
+      ((target_ - position_) * kTickMs) /
+      (interpolationMs_ > kTickMs ? interpolationMs_ : kTickMs) :
       static_cast<std::int32_t>(profileVelocity_) * kTickMs / 1000;
     const std::int32_t remaining = target_ - position_;
 
@@ -318,6 +361,9 @@ private:
     }
     if (setpointAcknowledged_) {sw |= sig::status_bits::kSetpointAcknowledge;}
     if (targetReached_) {sw |= sig::status_bits::kTargetReached;}
+    // Bit 12 under CSP is «Drive follows command value», not «Setpoint
+    // acknowledge». Same bit, different meaning, decided by 0x6061.
+    if (cspFollowing_) {sw |= sig::status_bits::kFollowsCommandValue;}
     (*this)[0x6041][0] = sw;
   }
 
@@ -329,6 +375,7 @@ private:
       // Losing power aborts whatever move was running.
       moving_ = false;
       setpointAcknowledged_ = false;
+      cspFollowing_ = false;
     }
     PublishStatusword();
   }
@@ -364,11 +411,27 @@ private:
 
       // Mode-specific handling, after the state machine has had its say.
       const std::int8_t mode = (*this)[0x6061][0];
-      if (static_cast<sig::OperationMode>(mode) ==
-        sig::OperationMode::kProfilePosition &&
+      const auto activeMode = static_cast<sig::OperationMode>(mode);
+
+      if (activeMode == sig::OperationMode::kProfilePosition &&
         state_ == sig::State::kOperationEnabled)
       {
         HandlePpm(cw);
+      } else if (activeMode == sig::OperationMode::kCyclicSynchronousPosition &&
+        state_ == sig::State::kOperationEnabled)
+      {
+        HandleCsp();
+      }
+    } else if (idx == 0x607A && subidx == 0) {
+      // A new target arriving by RPDO is what drives CSP. In PPM the same
+      // object is latched by the setpoint handshake instead, so the mode
+      // decides which of the two applies.
+      const std::int8_t mode = (*this)[0x6061][0];
+      if (static_cast<sig::OperationMode>(mode) ==
+        sig::OperationMode::kCyclicSynchronousPosition &&
+        state_ == sig::State::kOperationEnabled)
+      {
+        HandleCsp();
       }
     } else if (idx == 0x6060 && subidx == 0) {
       // Modes of operation: echo the request into Modes of operation display,

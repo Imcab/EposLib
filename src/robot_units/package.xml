@@ -1,26 +1,20 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>epos4_driver</name>
+  <name>robot_units</name>
   <version>0.1.0</version>
   <description>
-    C++ library for maxon EPOS4 motion controllers over CANopen
-    (CiA 301 / CiA 402). ROS independent: depends only on Lely CANopen.
+    Physical quantities for robot code: compile-time dimensional analysis and
+    unit conversion. Vendors nholthaus/units v2.3.5, the library WPILib's C++
+    bindings use. Header-only with no dependencies, so anything on the robot
+    can speak these types without pulling anything in.
   </description>
   <maintainer email="cabreratrejoimadjared@gmail.com">Imad Jared Cabrera Trejo</maintainer>
   <license>Apache-2.0</license>
+  <!-- The vendored header is MIT, see LICENSE-units.txt -->
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <!-- The only dependency of this package. If rclcpp, hardware_interface or
-       epos4_interfaces ever show up here, the architecture has been broken. -->
-  <depend>lely_core_libraries</depend>
-
-  <!-- Header-only, zero dependencies of its own. Feedback is reported in
-       these types so the rest of the robot speaks the same units. -->
-  <depend>robot_units</depend>
-
-  <test_depend>ament_cmake_uncrustify</test_depend>
   <test_depend>ament_cmake_lint_cmake</test_depend>
   <test_depend>ament_cmake_xmllint</test_depend>
   <test_depend>ament_cmake_gtest</test_depend>
