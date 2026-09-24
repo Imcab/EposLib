@@ -1,0 +1,70 @@
+# CANopen network description, consumed by dcfgen (from lely_core_libraries).
+#
+# dcfgen reads this plus each node's EDS and produces:
+#   master.dcf   what the master knows about the network, including the
+#                remote PDO mappings that make rpdo_mapped/tpdo_mapped work
+#   node_N.bin   the concise configuration the master pushes to each node at
+#                boot, which is where the PDO mapping below actually lands
+#
+# PDO mapping belongs here rather than in application code: both ends have to
+# agree on which bytes mean what, and this is the one place that writes both
+# sides from a single description. Remapping at run time over SDO would
+# configure the drive while leaving the master's own dictionary stale.
+#
+# Entries are named after their node-ID, not after any role in a machine:
+# this file describes a CAN network, not an application.
+#
+# Add a node by copying a block and changing the node-ID. The COB-ID of every
+# message is base + node-ID, so a lower node-ID wins bus arbitration: give the
+# low numbers to whatever must not be starved.
+
+master:
+  node_id: 1
+  baudrate: 1000
+  heartbeat_producer: 1000
+
+  # SYNC period in microseconds. The master broadcasts this pulse and every
+  # node applies its received setpoint on it, so all axes act on the same
+  # instant instead of drifting apart by whatever their frames took to
+  # arrive. 10000 us = 100 Hz.
+  #
+  # Set to 0 to disable SYNC entirely; the profiled modes (PPM, PVM) do not
+  # need it, only the cyclic ones do.
+  sync_period: 10000
+
+node_2:
+  node_id: 2
+  dcf: "epos4.eds"
+  heartbeat_producer: 500
+
+  # --- master -> drive ---
+  # transmission: 1 means "apply on every SYNC", which is what makes the
+  # cyclic modes deterministic. 255 would be event-driven, applied on arrival.
+  rpdo:
+    1:
+      cob_id: "auto"
+      transmission: 1
+      mapping:
+        - {index: 0x6040}   # Controlword          16 bit
+        - {index: 0x607A}   # Target position      32 bit
+    2:
+      cob_id: "auto"
+      transmission: 1
+      mapping:
+        - {index: 0x60FF}   # Target velocity      32 bit
+        - {index: 0x6071}   # Target torque        16 bit
+
+  # --- drive -> master ---
+  tpdo:
+    1:
+      cob_id: "auto"
+      transmission: 1
+      mapping:
+        - {index: 0x6041}   # Statusword           16 bit
+        - {index: 0x6064}   # Position actual      32 bit
+    2:
+      cob_id: "auto"
+      transmission: 1
+      mapping:
+        - {index: 0x606C}   # Velocity actual      32 bit
+        - {index: 0x6077}   # Torque actual        16 bit

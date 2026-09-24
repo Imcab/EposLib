@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------------------
+# colcon build artefacts
+# ---------------------------------------------------------------------------
+/build/
+/install/
+/log/
+
+# The same three can appear nested when colcon is run from inside a package
+# directory instead of the workspace root. They are still build output.
+**/build/
+**/install/
+**/log/
+
+# ---------------------------------------------------------------------------
+# Generated CANopen configuration
+#
+# dcfgen produces these from bus.yml plus each node's EDS on every build, so
+# they are output, not source. bus.yml and the .eds files ARE source and are
+# committed: they are the description the master is built from, and without
+# them the network cannot be regenerated.
+#
+# master.resolved.dcf is written at run time by CanBus, which rewrites the
+# UploadFile paths in master.dcf to absolute ones.
+# ---------------------------------------------------------------------------
+master.dcf
+master.bin
+master.resolved.dcf
+*.bin
+!**/config/**/*.eds
+
+# ---------------------------------------------------------------------------
+# Vendor documentation
+#
+# The EPOS4 manuals are freely downloadable from maxongroup.com and total
+# ~14 MB of binary that would sit in the history forever. Keep them locally,
+# out of the repository:
+#
+#   EPOS4 Firmware Specification   the object dictionary, the state machine,
+#                                  the operating modes, the error tables
+#   EPOS4 Communication Guide      CANopen framing and the COB-ID allocation
+#
+# Drop this section if the team would rather have them versioned alongside
+# the code that references them by page number.
+# ---------------------------------------------------------------------------
+/resources/*.pdf
+
+# ---------------------------------------------------------------------------
+# Editors and tooling
+# ---------------------------------------------------------------------------
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
+.vscode/browse.vc.db*
+.vscode/ipch/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+
+# ---------------------------------------------------------------------------
+# Build and debug leftovers
+# ---------------------------------------------------------------------------
+*.o
+*.a
+*.so
+*.so.*
+core
+core.*
+vgcore.*
+*.gcda
+*.gcno
+*.gcov
+perf.data*
+
+# ---------------------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
