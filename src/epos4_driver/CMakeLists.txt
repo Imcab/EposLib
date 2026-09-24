@@ -24,6 +24,7 @@ find_package(robot_units REQUIRED)
 # ---------------------------------------------------------------------------
 add_library(epos4_core SHARED
   src/core/Cia402StateMachine.cpp
+  src/core/CyclicState.cpp
   src/Version.cpp
   src/signals/Enums.cpp
   src/signals/Errors.cpp
@@ -136,6 +137,14 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_encoder_configs test/test_encoder_configs.cpp)
   target_link_libraries(test_encoder_configs ${PROJECT_NAME})
+
+  # Links the full library, not epos4_core, but opens no socket: it only
+  # exercises what a device allows before CanBus::Start().
+  ament_add_gtest(test_cyclic_state test/test_cyclic_state.cpp)
+  target_link_libraries(test_cyclic_state epos4_core)
+
+  ament_add_gtest(test_device_lifecycle test/test_device_lifecycle.cpp)
+  target_link_libraries(test_device_lifecycle ${PROJECT_NAME})
 endif()
 
 ament_package()

@@ -39,6 +39,8 @@ namespace epos4_ros2_control
 class Epos4System : public hardware_interface::SystemInterface
 {
 public:
+  ~Epos4System() override;
+
   hardware_interface::CallbackReturn on_init(
     const hardware_interface::HardwareInfo & info) override;
 
@@ -54,6 +56,13 @@ public:
   hardware_interface::CallbackReturn on_cleanup(
     const rclcpp_lifecycle::State & previous_state) override;
 
+  // Called by ros2_control when read() or write() returns ERROR. Without it
+  // the hardware drops to «unconfigured» with the cyclic path still running,
+  // and the master goes on sending «Enable operation» on every SYNC to an
+  // axis nobody is supervising any more.
+  hardware_interface::CallbackReturn on_error(
+    const rclcpp_lifecycle::State & previous_state) override;
+
   std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
 
@@ -64,6 +73,14 @@ public:
     const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 private:
+  // Stops publishing setpoints and commands every axis to disable. Shared by
+  // on_deactivate and on_error; completes even when axes do not answer.
+  void StopAxes();
+
+  // Devices first, then the bus: an Epos4 holds a reference to the master
+  // for as long as it exists. Safe to call when nothing is held.
+  void Release();
+
   // One per joint. The Epos4 is held by pointer because it is neither
   // copyable nor movable: it registers itself with the bus on construction.
   struct Axis

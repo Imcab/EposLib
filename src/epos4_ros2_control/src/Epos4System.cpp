@@ -1,6 +1,8 @@
 #include "epos4_ros2_control/Epos4System.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -12,6 +14,7 @@
 
 #include <units.h>
 
+#include "epos4/core/Cia402StateMachine.hpp"
 #include "epos4/signals/Errors.hpp"
 
 namespace epos4_ros2_control
@@ -36,6 +39,55 @@ GetParam(
 {
   const auto it = params.find(key);
   return it == params.end() ? fallback : it->second;
+}
+
+// Why an axis stopped being healthy, from what is already in memory.
+//
+// Runs inside read(), so it must not touch the bus. It used to call
+// DescribeLastError(), which reads 0x603F and 0x1001 over SDO: against a node
+// that has gone silent each read waits out the full SDO timeout, stalling the
+// control loop for every other axis at exactly the moment it matters. The
+// PDO age and the last Statusword are cached, and the error code arrives by
+// EMCY without being asked for.
+std::string
+ExplainUnhealthy(const epos4::Epos4 & device)
+{
+  const auto age = device.GetTimeSinceLastPdo();
+  const std::uint16_t statusword = device.GetCachedStatusword();
+  const auto state = epos4::core::Decode(statusword);
+  const std::uint16_t code = device.GetCachedErrorCode();
+
+  char buffer[256];
+  std::string text;
+
+  if (age == std::chrono::steady_clock::duration::max()) {
+    text = "no PDO ever received";
+  } else {
+    std::snprintf(
+      buffer, sizeof(buffer), "last PDO %lld ms ago",
+      static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(age).count()));
+    text = buffer;
+  }
+
+  std::snprintf(
+    buffer, sizeof(buffer), "; last reported state «%s» (statusword 0x%04X)",
+    state ? epos4::signals::ToString(*state) : "unrecognised", statusword);
+  text += buffer;
+
+  if (code != 0) {
+    // With its age: an EMCY left over from the boot sequence would otherwise
+    // read as the cause of a failure that happened minutes later.
+    const auto * error = epos4::signals::FindDeviceError(code);
+    const auto emcyAge = std::chrono::duration_cast<std::chrono::milliseconds>(
+      device.GetTimeSinceLastEmergency());
+    std::snprintf(
+      buffer, sizeof(buffer), "; last EMCY 0x%04X %s, %lld ms ago", code,
+      error ? error->name : "(not in the EPOS4 error tables)",
+      static_cast<long long>(emcyAge.count()));
+    text += buffer;
+  }
+  return text;
 }
 
 }  // namespace
@@ -155,9 +207,56 @@ Epos4System::on_init(const hardware_interface::HardwareInfo & info)
 }
 
 
+Epos4System::~Epos4System()
+{
+  // Not left to the implicit destructor. Members are destroyed in reverse
+  // order of declaration, and bus_ is declared after axes_, so the bus would
+  // go first and every device would then be destroyed against a master that
+  // no longer exists. That is the path taken whenever the process exits
+  // without on_cleanup - Ctrl-C while active, or after on_error.
+  Release();
+}
+
+
+void
+Epos4System::Release()
+{
+  for (auto & axis : axes_) {
+    axis.device.reset();
+  }
+  bus_.reset();
+}
+
+
+void
+Epos4System::StopAxes()
+{
+  // Must complete even with a faulted or silent axis: being unable to shut
+  // down is worst exactly when something has already gone wrong. Failures
+  // are logged, not propagated.
+  //
+  // Against a node that has gone silent Disable() times out, but not before
+  // it has written «Disable voltage» into the RPDO. With the cyclic path
+  // stopped nothing overwrites it, so the master keeps sending it on every
+  // SYNC and a drive that comes back is told to drop power, not to resume.
+  for (auto & axis : axes_) {
+    if (!axis.device) {continue;}
+    axis.device->ExitCyclicMode();
+    if (!axis.device->Disable()) {
+      RCLCPP_WARN(Log(), "joint '%s' did not confirm disable", axis.name.c_str());
+    }
+  }
+}
+
+
 hardware_interface::CallbackReturn
 Epos4System::on_configure(const rclcpp_lifecycle::State &)
 {
+  // on_error leaves the bus up on purpose (see StopAxes), so a configure
+  // that follows it finds one. Replacing bus_ while the old devices still
+  // point at its master would destroy it under them.
+  Release();
+
   try {
     bus_ = std::make_unique<epos4::CanBus>(
       epos4::CanBus::Options{canInterface_, masterDcf_, masterNodeId_});
@@ -246,15 +345,19 @@ Epos4System::on_activate(const rclcpp_lifecycle::State &)
 hardware_interface::CallbackReturn
 Epos4System::on_deactivate(const rclcpp_lifecycle::State &)
 {
-  // Deactivation must complete even with a faulted axis: being unable to shut
-  // down is worst exactly when something has already gone wrong. Failures are
-  // logged, not propagated.
-  for (auto & axis : axes_) {
-    axis.device->ExitCyclicMode();
-    if (!axis.device->Disable()) {
-      RCLCPP_WARN(Log(), "joint '%s' did not confirm disable", axis.name.c_str());
-    }
-  }
+  StopAxes();
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+
+hardware_interface::CallbackReturn
+Epos4System::on_error(const rclcpp_lifecycle::State &)
+{
+  // The bus is deliberately kept up: it is what carries the disable command
+  // to an axis that reconnects. Releasing it here would leave «Enable
+  // operation» as the last thing that axis ever received.
+  StopAxes();
+  unhealthyReported_ = false;
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -262,12 +365,7 @@ Epos4System::on_deactivate(const rclcpp_lifecycle::State &)
 hardware_interface::CallbackReturn
 Epos4System::on_cleanup(const rclcpp_lifecycle::State &)
 {
-  // Devices before the bus: an Epos4 holds a reference to the master for as
-  // long as it exists.
-  for (auto & axis : axes_) {
-    axis.device.reset();
-  }
-  bus_.reset();
+  Release();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -323,8 +421,8 @@ Epos4System::read(const rclcpp::Time &, const rclcpp::Duration &)
       if (!unhealthyReported_) {
         RCLCPP_ERROR(
           Log(), "joint '%s' stopped delivering PDOs or left «Operation "
-          "enabled». %s", axis.name.c_str(),
-          axis.device->DescribeLastError().c_str());
+          "enabled»: %s", axis.name.c_str(),
+          ExplainUnhealthy(*axis.device).c_str());
       }
     }
   }

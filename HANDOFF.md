@@ -723,7 +723,7 @@ config/
 ├── epos4_network/          ← HARDWARE REAL
 │   ├── bus.yml             79 líneas, muy comentado
 │   └── epos4.eds           5754 líneas, exportado de EPOS Studio
-└── sim_network/            ← SIMULACIÓN
+└── sim_network/            ← SOLO para el mock de canopen_fake_slaves (NO epos4_sim, §10.3)
     ├── bus.yml             89 líneas
     └── sim_slave.eds       1442 líneas
 launch/                     ⚠️ VACÍO
@@ -1085,8 +1085,8 @@ controlador seguiría creyendo que un eje muerto está siguiendo la trayectoria.
 
 ### 8.8 Estado
 
-✅ **Implementado y compilando.**
-❌ **Sin tests propios.** Ver §11, punto 3.
+✅ **Implementado, compilando y verificado de extremo a extremo.**
+✅ **Testeado sin bus** vía `core::CyclicState` (§11, paso 3).
 
 ---
 
@@ -1289,7 +1289,7 @@ no desde el path del paquete.
 ### 9.11 Estado
 
 ✅ Escrito, compilando, 12 tests en verde.
-❌ **Nunca cargado por `controller_manager`.** Falta el bringup (§11–12).
+✅ **Cargado por `controller_manager` y verificado contra `epos4_sim`** (§11 pasos 2 y 4).
 
 ---
 
@@ -1336,7 +1336,27 @@ class Epos4Sim : public canopen::BasicSlave
   (`sig::status_bits::kFollowsCommandValue`) mientras está siguiendo.
 - Limpia `cspFollowing_` al salir del modo.
 
-### 10.3 ⚠️ EL BLOQUEO
+### 10.3 ✅ EL "BLOQUEO" — RESUELTO (2026-09-24, sesión siguiente): ERA UN DIAGNÓSTICO EQUIVOCADO
+
+> **Lo de abajo es FALSO y se deja tachado como registro.** `BasicSlave` SÍ
+> aplica el mapeo que descarga el master. Verificado con una sonda en memoria
+> (`io::VirtualCanController`, sin `vcan0` ni sudo): master con el DCF de
+> `epos4_network` + esclavo con `epos4.eds` → `0x1600/0x1601/0x1A00/0x1A01`
+> quedan exactamente como `bus.yml`, 299 TPDOs de cada objeto y 299 escrituras
+> RPDO de `0x607A` en 3 s (100 Hz).
+>
+> **Causa real:** `epos4_sim` fuerza la identidad maxon (`SetIdentity()`,
+> vendor `0xFB`) y se estaba lanzando contra el DCF de **`sim_network`**, que
+> espera `0x555` (el mock de `canopen_fake_slaves`). El master aborta con
+> `es='D'` **antes** de descargar `node_2.bin`, el simulador se queda con el
+> mapeo por defecto del EDS, y el master sigue decodificando esas tramas con
+> *su* mapeo → basura con pinta de dato. Reproducido con la misma sonda.
+>
+> **Arreglo:** `epos4_sim` va SIEMPRE con `epos4.eds` + `epos4_network`.
+> `sim_network` solo sirve para el mock de `canopen_fake_slaves`. No hay que
+> tocar ni el EDS ni el simulador.
+
+~~Texto original:~~
 
 > **`BasicSlave` de Lely acepta las escrituras SDO del mapeo PDO pero NO
 > remapea sus PDOs en caliente.** Se queda con el mapeo del EDS.
@@ -1373,7 +1393,13 @@ Pistas de implementación:
 
 ## 11. Siguientes pasos, en orden
 
-### Paso 1 — Desbloquear el mapeo PDO del simulador ⬅️ **EMPEZAR AQUÍ**
+### Paso 1 — ~~Desbloquear el mapeo PDO del simulador~~ ✅ HECHO (no había bloqueo, ver §10.3)
+
+**Verificado sobre `vcan0` con la librería real** (`api_demo` + `epos4_sim`
+con `epos4_network`): los cuatro PDOs (`182`, `282`, `202`, `302`) salen con
+6 bytes, `pdo: active`, y un movimiento PPM de 50000 cuentas avanza por TPDO.
+Por el camino aparecieron y se arreglaron dos bugs (ver §16, las dos filas
+de PPM).
 
 **Por qué primero:** sin esto no se puede verificar nada de lo demás.
 
@@ -1390,7 +1416,24 @@ y en la aplicación, `motor.IsPdoActive()` devuelve `true` y
 
 ---
 
-### Paso 2 — Escribir los tres archivos de bringup
+### Paso 2 — Escribir los archivos de bringup ✅ HECHO
+
+Son cuatro, no tres: `ros2_control_node` necesita un URDF completo, así que
+además de la macro hay un URDF mínimo de un eje.
+
+```
+config/epos4.ros2_control.xacro   macros epos4_system + epos4_joint (genéricas)
+config/epos4_arm.urdf.xacro       base_link + joint 'shoulder' (node 2, placeholders)
+config/controllers.yaml           100 Hz, JSB + arm_controller (+ JointGroupPosition opcional)
+launch/arm.launch.py              arg can_interface (vcan0/can0), master_dcf, description
+```
+
+El launch ya no tiene argumento `sim`: simulador y hardware usan el mismo DCF
+(`epos4_network`), solo cambia `can_interface`. **Verificado contra
+`epos4_sim`**; al hacerlo aparecieron el segfault de `SetMechanism()` y el
+temporizador del simulador que no avanzaba en CSP (ver §16).
+
+~~Plan original:~~
 
 ```
 src/epos4_bringup/config/epos4_arm.ros2_control.xacro
@@ -1407,7 +1450,21 @@ en `install/epos4_bringup/share/epos4_bringup/`.
 
 ---
 
-### Paso 3 — Tests del camino cíclico en el driver
+### Paso 3 — Tests del camino cíclico en el driver ✅ HECHO (2026-09-24)
+
+Ni test-friend ni constructor de test: el estado cíclico se sacó a
+**`core::CyclicState`** (`include/epos4/core/CyclicState.hpp`, en
+`epos4_core`, sin Lely), con el reloj inyectado. `Impl` lo alimenta desde
+`OnRpdoWrite`/`OnSync`; `test_cyclic_state` (15 tests) lo alimenta a mano.
+Comprobado por mutación: quitar la comprobación de edad hace fallar 3 tests.
+Re-verificado de extremo a extremo en `vcan0` tras el refactor (−0,4 rad
+exactos).
+
+Al hacerlo salieron dos bugs (ver §16): orden de memoria del flag «active»
+(podía publicarse un 0 en el primer SYNC en ARM) y `QuickStop()`/`Halt()`
+pisados por `OnSync` durante el modo cíclico.
+
+~~Plan original:~~
 
 Están en el plan aprobado y **no se escribieron**. En `epos4_driver`, sin bus:
 
@@ -1425,7 +1482,21 @@ preferibles: el plan dice **"sin bus"**.
 
 ---
 
-### Paso 4 — Verificación end-to-end contra el simulador
+### Paso 4 — Verificación end-to-end contra el simulador ✅ HECHO (2026-09-24)
+
+Trayectoria a 0,5 rad en 3 s: el RPDO `0x202` lleva una Target position nueva
+en cada SYNC, sin SDO durante el movimiento; la posición sigue ~100 cuentas
+(≈3 mrad) por detrás y llega a 15915 cuentas = 0,500 rad en ~3,2 s. Cero
+errores de tolerancia. 
+
+**§13.7 (red de seguridad) también verificado:** matar el simulador con el
+controlador activo → detección en ~64 ms (umbral de 50 ms + un ciclo), un
+solo log sin tocar el bus, `on_error` desactiva el camino cíclico y el RPDO
+pasa a llevar `0x000D` («Disable voltage») en cada SYNC. Nota: en Humble los
+controladores siguen figurando `active` tras el error del hardware; es
+comportamiento de ros2_control Humble, no del plugin.
+
+~~Plan original:~~
 
 Receta completa en **§13**.
 
@@ -1437,7 +1508,16 @@ Receta completa en **§13**.
 
 ---
 
-### Paso 5 — Limpieza y commit
+### Paso 5 — Limpieza ✅ HECHO (2026-09-24)
+
+Borrados `src/epos4_driver/{install,build,log}`. Build **desde cero**
+(`rm -rf build install log`) sin un solo aviso, tras quitar dos `-Wcomment`
+(comentarios `//` terminados en `\`) y los inicializadores designados C++20
+de `api_demo`. uncrustify limpio, sin headers de ROS en `epos4_driver`, sin
+direcciones hex desnudas. **213 tests, 0 fallos.** Los commits, pendientes
+de Imad.
+
+~~Plan original:~~
 
 ```bash
 rm -rf src/epos4_driver/install src/epos4_driver/build src/epos4_driver/log
@@ -1450,7 +1530,14 @@ Mensajes de commit en **§17**. **Los ejecuta Imad, no la sesión.**
 
 ---
 
-### Paso 6 — Actualizar CHANGELOG y README
+### Paso 6 — Actualizar CHANGELOG y README ✅ HECHO (2026-09-24)
+
+CHANGELOG: sección `[Unreleased]` con todo lo de esta sesión. README:
+estado, tabla de paquetes, secciones nuevas «Under ros2_control» y «When
+something dies», `bus.yml` con heartbeat, ejemplos en C++17, limitaciones
+al día.
+
+~~Plan original:~~
 
 El `CHANGELOG.md` de `epos4_driver` sigue diciendo:
 
@@ -1505,7 +1592,7 @@ Antes de conectar:
 
        KEEP master_dcf IN STEP with which network was generated:
          epos4_network  real hardware
-         sim_network    the epos4_sim simulator
+         sim_network    the canopen_fake_slaves mock ONLY (epos4_sim uses epos4_network)
        =================================================================== -->
   <xacro:macro name="epos4_arm_ros2_control"
                params="name:=epos4_arm
@@ -1662,7 +1749,11 @@ def generate_launch_description():
     can_interface = LaunchConfiguration('can_interface')
 
     # ---- the two networks generate_dcf() produced at build time ----------
-    sim_dcf = os.path.join(share, 'config', 'sim_network', 'master.dcf')
+    # epos4_sim answers with the maxon identity, so it runs on the SAME
+    # network as the hardware. sim_network is for the canopen_fake_slaves
+    # mock only: against it the boot aborts with es='D' before the PDO
+    # mapping is downloaded.
+    sim_dcf = os.path.join(share, 'config', 'epos4_network', 'master.dcf')
     hw_dcf = os.path.join(share, 'config', 'epos4_network', 'master.dcf')
 
     controllers = os.path.join(share, 'config', 'controllers.yaml')
@@ -1726,7 +1817,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'sim', default_value='true',
-            description='Use the sim_network DCF and expect epos4_sim on vcan0'),
+            description='Expect epos4_sim on vcan0 (same epos4_network DCF as hardware)'),
         DeclareLaunchArgument(
             'can_interface', default_value='vcan0',
             description='SocketCAN interface name'),
@@ -1778,8 +1869,9 @@ source install/setup.bash
 ```bash
 cd /data/epos_controller_ws
 source install/setup.bash
-CFG=install/epos4_bringup/share/epos4_bringup/config/sim_network
-./build/epos4_driver/epos4_sim $CFG/sim_slave.eds 2 vcan0
+# epos4_network, NO sim_network (ver §10.3)
+CFG=install/epos4_bringup/share/epos4_bringup/config/epos4_network
+./build/epos4_driver/epos4_sim $CFG/epos4.eds 2 vcan0
 ```
 
 **Terminal 2 — el tráfico crudo** (dejarlo corriendo desde el principio)
@@ -1832,7 +1924,9 @@ arm_controller          joint_trajectory_controller/JointTrajectoryController  a
 ### 13.5 Mover el eje
 
 ```bash
-ros2 topic pub --once /arm_controller/joint_trajectory \
+# -w 1: espera a que haya un suscriptor. Sin él, --once a veces publica y
+# sale antes del descubrimiento DDS, y parece que el eje no responde.
+ros2 topic pub -w 1 --once /arm_controller/joint_trajectory \
   trajectory_msgs/msg/JointTrajectory "{
     joint_names: ['shoulder'],
     points: [
@@ -1906,6 +2000,8 @@ colcon test-result --all
 ```
 
 **Resultado: `Summary: 184 tests, 0 errors, 0 failures, 0 skipped`** ✅
+
+> **Actualizado (sesión siguiente, build desde cero):** `213 tests, 0 errors, 0 failures`. Nuevos: `test_cyclic_state` (15), `test_device_lifecycle` (4), más linters de los archivos nuevos.
 
 Desglose:
 
@@ -2032,7 +2128,21 @@ tiempo real de depuración. No volver a caer.
 | `add_test NAME "xmllint" already exists` | `ament_xmllint` nombra el test según sí mismo | Una sola llamada con varios archivos (§15.1) |
 | `package.xml` inválido | Orden de elementos del esquema format 3 | `<member_of_group>` después de los `*_depend` (§15.2) |
 | El mock de `canopen_fake_slaves` no servía | Responde `0x0040` a **cualquier** escritura del Controlword y nunca avanza | Se escribió `epos4_sim` |
-| PPM no verificable en simulación | `BasicSlave` acepta el mapeo PDO por SDO pero **no remapea en caliente** | ⚠️ **SIGUE ABIERTO** — §10.3 |
+| PPM/CSP "no verificable" en simulación; el esclavo conserva el mapeo del EDS | **Diagnóstico equivocado.** `epos4_sim` (vendor `0xFB`) contra el DCF de `sim_network` (espera `0x555`): `es='D'` aborta el boot antes de descargar el mapeo | ✅ Usar `epos4_network` con el simulador — §10.3 |
+| PPM: handshake perfecto pero el eje no se mueve (captura `0 -> 0`) | Target position (`0x607A`) se escribía solo por SDO; está en el RPDO1 con transmisión 1, así que el siguiente SYNC la pisaba con la copia del master (0) | `Impl::WriteOutput()`: toda salida mapeada va por RPDO, SDO solo si no está mapeada. Aplicado a los 5 modos |
+| El simulador capturaba el target anterior aunque el RPDO traía el nuevo | Lely escribe los objetos de un RPDO uno a uno en orden de mapeo y llama a `OnWrite` tras cada uno; el Controlword va antes que `0x607A` | `epos4_sim` aplaza `HandleControlword()` con `GetExecutor().post()` |
+| Segfault en `Epos4System::on_configure` → `Epos4::SetMechanism` | `Encoder` (que guarda la escala) vivía en `Impl`, creado en `Attach()` = dentro de `Start()`; el plugin fija la mecánica ANTES de `Start()`, como es obligatorio | `Configurator` y `Encoder` pasan a ser miembros de `Epos4`, creados en el constructor. Test: `test_device_lifecycle` |
+| En CSP el simulador no se movía nunca; el JTC disparaba la tolerancia y "se quedaba" en 0 | `HandleCsp()` rearmaba el temporizador de 20 ms en cada SYNC de 10 ms: nunca expiraba | `ArmMotion()` no rearma si ya hay un paso pendiente (`motionArmed_`) |
+| Frame `0F 00 00 00 00 00` (habilitado, objetivo 0) al final de una prueba | **No es un bug:** el JTC, tras violar la tolerancia, mantiene la posición *medida*, que era 0 porque el simulador no se movía | — |
+| `read()` se bloqueaba al detectar un eje muerto | El log llamaba a `DescribeLastError()`: dos lecturas SDO contra un nodo mudo, cada una esperando el timeout, dentro del lazo RT | Log solo con datos en memoria: edad del PDO, Statusword cacheado, último EMCY **con su edad** (`GetCachedErrorCode`, `GetTimeSinceLastEmergency`) |
+| Tras un error, el master seguía mandando «Enable operation» (`0x000F`) en cada SYNC a un eje sin supervisión | El plugin no implementaba `on_error`: ros2_control lo deja `unconfigured` sin pasar por `on_deactivate` | `on_error` → `StopAxes()`: `ExitCyclicMode` + `Disable`. El bus se mantiene para que siga saliendo `0x000D` |
+| Posible UB al salir con Ctrl-C estando activo | `bus_` se declara después de `axes_` → se destruía antes que los dispositivos | Destructor + `Release()` (dispositivos primero). `on_configure` también libera lo que dejó `on_error` |
+| `SetEmergencyCallback()` antes de `Start()` no hacía nada | `if (!impl_) return;` silencioso | Se guarda en `pendingEmcyCallback_` y se instala en `Attach()` |
+| El log mostraba `last EMCY 0x8220` como causa | Era un EMCY del arranque del simulador (CiA 301, longitud de PDO), 20 s antes | Se imprime con su edad |
+| (Teórico, ARM) primer SYNC tras `EnterCyclicPositionMode()` podía publicar objetivo 0 | Consigna sembrada y flag `cyclicActive` ambos `relaxed`: el hilo del bus podía ver el flag antes que la siembra | `CyclicState`: store release / load acquire del flag; test `AReaderThatSeesActiveSeesTheSeededTarget` |
+| `QuickStop()`/`Halt()` en modo cíclico duraban un solo SYNC | `OnSync` republicaba la copia del Controlword tomada al entrar en modo cíclico | `WriteControlword()` actualiza también `cyclic.SetControlword()` |
+| La trayectoria "no movía el eje" en una prueba | `ros2 topic pub --once` publicó antes del descubrimiento DDS; el driver estaba bien | `ros2 topic pub -w 1 --once` |
+| `colcon test` fallaba con un código que ya estaba corregido; el binario de `build/` pasaba | CMake decide "Up-to-date" en el install comparando mtimes con resolución de 1 s: una `.so` recompilada en el mismo segundo que la anterior no se copió a `install/`, y los tests cargan la de `install/` | Comparar la sección `.text` (`objcopy -O binary --only-section=.text`), **no** el md5 del archivo: el install reescribe el RUNPATH de las `.so` que enlazan contra otras del build, y el md5 difiere aunque el código sea idéntico. Si `.text` difiere, borrar la de `install/` y recompilar |
 | Imad no veía los archivos | Se estaba trabajando en un directorio temporal | Todo directo a `src/` |
 | Se iba demasiado rápido en CANopen | — | Se volvió a cero: tramas CAN, arbitraje, COB-ID, tipos de mensaje, bus-off, epoll |
 
@@ -2206,9 +2316,27 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 | # | Cosa | Dónde |
 |---|---|---|
-| 1 | **El simulador no aplica el mapeo PDO que le empuja el master** | §10.3 |
+| 1 | ~~El simulador no aplica el mapeo PDO~~ — era la red equivocada, resuelto | §10.3 |
 | 2 | Faltan los tres archivos de bringup | §12 |
 | 3 | Faltan los tests del camino cíclico | §11 paso 3 |
+
+### Heartbeat consumer ✅ HECHO (2026-09-24)
+
+El drive vigila al master: `heartbeat_consumer: true` en `epos4_network/bus.yml`
+y heartbeat del master a 100 ms → `0x1016:01 = 0x0001012C` (nodo 1, 300 ms).
+Verificado con `kill -9` de `ros2_control_node`: EMCY `0x8130` a los 300 ms,
+el nodo pasa a pre-operacional (heartbeat `05` → `7F`) y deja de emitir PDOs.
+
+✅ **`ClearFault()` ya recupera `0x8130`/`0x8120`** (§7.2.35): manda NMT reset
+communication, espera al `OnBoot` del nodo (contador `bootCount` en `Impl`) y
+luego hace el fault reset. Decide con `signals::RequiresCommunicationReset()`,
+derivada del texto de recuperación transcrito. Verificado congelando el master
+1 s con `SIGSTOP`: limpio en ~540 ms y re-habilitado con PDOs.
+
+De paso: las lecturas "preferir PDO" solo usan la caché si el PDO tiene
+< 100 ms (antes `ClearFault()` veía «Operation enabled» viejo y devolvía
+`true` con el eje en Fault), y `epos4_sim` distingue reset node de reset
+communication.
 
 ### Nada ha corrido contra hardware real
 
@@ -2341,11 +2469,11 @@ DÓNDE ESTAMOS
   NADA ha corrido contra hardware real.
 
 QUÉ FALTA, EN ORDEN
-  1. Que el simulador aplique el mapeo PDO   ← BLOQUEA TODO LO DEMÁS
-  2. Los tres archivos de bringup (xacro, controllers.yaml, launch.py)
-  3. Tests del camino cíclico en el driver
-  4. Verificación end-to-end: candump vcan0 | grep ' 202 '
-  5. Actualizar CHANGELOG y README
+  1. ✅ Mapeo PDO del simulador: no había bloqueo (red equivocada, §10.3)
+  2. ✅ Bringup (xacro, urdf, controllers.yaml, launch.py) — verificado
+  3. ✅ Tests del camino cíclico (core::CyclicState, 15 tests)
+  4. ✅ End-to-end verificado, incluida la red de seguridad (§13.7)
+  5. ✅ Limpieza, CHANGELOG y README
 
 REGLAS QUE NO SE ROMPEN
   · Git lo ejecuta Imad. La sesión solo redacta el mensaje del commit.

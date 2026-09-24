@@ -15,9 +15,10 @@
 // the master's identity check against 0x1F84/0x1F85 passes and the same
 // config that will talk to the real drive can be used against it.
 //
-// Run:
-//   ./build/epos4_driver/epos4_sim \
-//       install/epos4_bringup/share/epos4_bringup/config/epos4_network/epos4.eds 2
+// Run, on the SAME network as the hardware (epos4_network), because this
+// answers with the maxon identity:
+//   CFG=install/epos4_bringup/share/epos4_bringup/config/epos4_network
+//   ./build/epos4_driver/epos4_sim $CFG/epos4.eds 2 vcan0
 
 #include <lely/coapp/slave.hpp>
 #include <lely/ev/loop.hpp>
@@ -189,25 +190,76 @@ public:
   }
 
 private:
-  // An NMT reset from the master reloads the object dictionary from the EDS,
-  // which wipes the identity written by SetIdentity() and makes the master
-  // reject us with es='D' on the very next boot attempt. Re-apply it, and go
-  // back to «Not ready to switch on» like a drive that just powered up.
+  // Both NMT resets reload the communication objects (0x1000-0x1FFF) from
+  // the EDS, which wipes the identity written by SetIdentity() and makes the
+  // master reject us with es='D' on the very next boot attempt, so both
+  // re-apply it. Beyond that they differ, and the difference is the point:
+  //
+  //   reset node           the whole device restarts: back to «Not ready to
+  //                        switch on», any fault gone, like a power cycle.
+  //   reset communication  only the communication side restarts. The CiA 402
+  //                        state machine is application, untouched - a drive
+  //                        in «Fault» is still in «Fault» afterwards. What it
+  //                        does do is satisfy the first half of the recovery
+  //                        of a communication fault (7.2.35), after which the
+  //                        Controlword fault reset is accepted.
+  //
+  // The master sends reset communication to every node when it starts, so a
+  // drive faulted by a previous master that died stays faulted for the next
+  // one until somebody clears it on purpose - as on the real hardware.
   void
   OnCommand(canopen::NmtCommand cs) noexcept override
   {
-    if (cs == canopen::NmtCommand::RESET_NODE ||
-      cs == canopen::NmtCommand::RESET_COMM)
-    {
-      printf("[sim] NMT reset received, restoring identity\n");
+    if (cs == canopen::NmtCommand::RESET_NODE) {
+      printf("[sim] NMT reset node: full restart\n");
       SetIdentity();
+      commResetPending_ = false;
+      (*this)[0x603F][0] = std::uint16_t{0};
       SetState(sig::State::kNotReadyToSwitchOn);
       last_cw_ = 0;
       // Re-arm transition 1. Without this the simulator stays in «Not ready
       // to switch on» forever after the master's reset, because the one-shot
       // power-up timer has already fired.
       ArmInit();
+    } else if (cs == canopen::NmtCommand::RESET_COMM) {
+      printf(
+        "[sim] NMT reset communication: state stays %s%s\n", StateName(state_),
+        commResetPending_ ? ", communication fault now clearable" : "");
+      SetIdentity();
+      commResetPending_ = false;
     }
+  }
+
+  // Set by a communication fault whose recovery needs an NMT reset
+  // communication first; until one arrives the Controlword fault reset is
+  // ignored, exactly the behaviour ClearFault() has to cope with.
+  bool commResetPending_{false};
+
+  // The master's heartbeat stopped arriving within «Consumer heartbeat time»
+  // (0x1016), which the master configured at boot. Lely's own consumer
+  // detects it; what the drive does next is the EPOS4's part, section 7.2.35:
+  // «CAN heartbeat error» 0x8130, a fault labelled "a", whose reaction is
+  // «Abort connection option code» (0x6007). Its default, 3, is a quick stop
+  // ramp and then disable; the ramp is not modelled, the axis just stops.
+  //
+  // Error() sends the EMCY and applies «Error behavior» (0x1029): NMT
+  // pre-operational by default, which is what stops this node's PDOs.
+  //
+  // Nothing happens when the heartbeat comes back. On the real drive the
+  // fault stays until an NMT reset communication plus a fault reset; a master
+  // that restarts sends the NMT reset as part of booting the node anyway.
+  void
+  OnHeartbeat(std::uint8_t id, bool occurred) noexcept override
+  {
+    if (!occurred) {
+      printf("[sim] heartbeat of node %u is back; fault stays until reset\n", id);
+      return;
+    }
+    printf("[sim] heartbeat of node %u lost -> CAN heartbeat error 0x8130 -> Fault\n", id);
+    (*this)[0x603F][0] = std::uint16_t{0x8130};
+    commResetPending_ = true;
+    SetState(sig::State::kFault);
+    Error(0x8130, 0x10);  // 0x10: communication error, Table 6-60
   }
 
   sig::State state_{sig::State::kNotReadyToSwitchOn};
@@ -228,6 +280,7 @@ private:
   bool setpointAcknowledged_{false};
   bool targetReached_{true};
   io::Timer * motionTimer_{nullptr};
+  bool motionArmed_{false};
   std::uint16_t last_cw_{0};
   io::Timer * init_timer_{nullptr};
 
@@ -338,12 +391,22 @@ private:
     if (moving_) {ArmMotion();}
   }
 
+  // Arms the next motion step unless one is already pending.
+  //
+  // Under CSP this is called on every new target, i.e. on every SYNC. With a
+  // 10 ms SYNC and a 20 ms tick, re-arming each time pushed the expiry out
+  // before it was ever reached: the timer never fired, the position never
+  // left zero, and the trajectory controller tripped its tolerance while the
+  // targets kept arriving perfectly. A step already pending will read the
+  // latest target_ when it runs, so there is nothing to re-arm for.
   void
   ArmMotion()
   {
-    if (!motionTimer_) {return;}
+    if (!motionTimer_ || motionArmed_) {return;}
+    motionArmed_ = true;
     motionTimer_->submit_wait(
       [this](int, ::std::error_code ec) {
+        motionArmed_ = false;
         if (!ec) {StepMotion();}
       });
     motionTimer_->settime(std::chrono::milliseconds(20));
@@ -380,11 +443,12 @@ private:
     PublishStatusword();
   }
 
-  // Called whenever the master writes an object over SDO or RPDO.
+  // Evaluates the Controlword currently in the dictionary: the state machine
+  // first, then whatever the active mode does with its mode bits.
   void
-  OnWrite(std::uint16_t idx, std::uint8_t subidx) noexcept override
+  HandleControlword()
   {
-    if (idx == 0x6040 && subidx == 0) {
+    {
       const std::uint16_t cw = (*this)[0x6040][0];
 
       // Fault reset is edge triggered: only a 0->1 transition of bit 7 counts.
@@ -395,7 +459,14 @@ private:
       last_cw_ = cw;
 
       if (reset_edge && state_ == sig::State::kFault) {
+        if (commResetPending_) {
+          printf(
+            "[sim] cw=0x%04X  fault reset IGNORED: 0x8130 needs an NMT reset "
+            "communication first (7.2.35)\n", cw);
+          return;
+        }
         printf("[sim] cw=0x%04X  fault reset edge -> Switch on disabled\n", cw);
+        (*this)[0x603F][0] = std::uint16_t{0};
         SetState(sig::State::kSwitchOnDisabled);
         return;
       }
@@ -422,6 +493,22 @@ private:
       {
         HandleCsp();
       }
+    }
+  }
+
+  // Called whenever the master writes an object over SDO or RPDO.
+  void
+  OnWrite(std::uint16_t idx, std::uint8_t subidx) noexcept override
+  {
+    if (idx == 0x6040 && subidx == 0) {
+      // Deferred, not handled inline. Lely writes the objects of a received
+      // RPDO one at a time in mapping order, and calls this after each one.
+      // RPDO1 carries the Controlword BEFORE Target position, so handling it
+      // here would latch the PPM setpoint while 0x607A still held the previous
+      // value - the master raised «New setpoint» and sent the new target in
+      // the very same frame. A real drive applies the whole PDO before acting
+      // on it; posting to the executor runs this once the frame is complete.
+      GetExecutor().post([this]() {HandleControlword();});
     } else if (idx == 0x607A && subidx == 0) {
       // A new target arriving by RPDO is what drives CSP. In PPM the same
       // object is latched by the setpoint handshake instead, so the mode

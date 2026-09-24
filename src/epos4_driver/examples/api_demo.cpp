@@ -1,9 +1,9 @@
 // The epos4 API, end to end.
 //
 // Run against the simulator:
-//   ./build/epos4_driver/epos4_sim <eds> 2 vcan0 &
-//   ./build/epos4_driver/api_demo install/epos4_bringup/share/epos4_bringup/\
-//       config/epos4_network/master.dcf
+//   CFG=install/epos4_bringup/share/epos4_bringup/config/epos4_network
+//   ./build/epos4_driver/epos4_sim $CFG/epos4.eds 2 vcan0 &
+//   ./build/epos4_driver/api_demo $CFG/master.dcf vcan0 2
 //
 // Against real hardware only the interface name and the DCF change.
 
@@ -29,7 +29,8 @@ main(int argc, char ** argv)
   const std::uint8_t nodeId = static_cast<std::uint8_t>((argc > 3) ? std::atoi(argv[3]) : 2);
 
   // ---- the bus: one per CAN network, shared by every device on it ----
-  epos4::CanBus bus{{.interface = iface, .masterDcf = dcf, .masterNodeId = 1}};
+  // Positional: designated initializers are C++20 and this is C++17.
+  epos4::CanBus bus{{iface, dcf, 1}};  // interface, master DCF, master node-ID
 
   // ---- the device, declared BEFORE the bus comes up ----
   // The master boots each slave once, at reset, and only routes a node's PDOs

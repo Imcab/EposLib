@@ -2,12 +2,20 @@
 # Target torque (0x6071) or Torque actual (0x6077), so those are left out and
 # Position demand (0x6062) takes the second TPDO slot instead.
 
-# SIMULATION network. See epos4_network/bus.yml for the full commentary.
+# Network for the canopen_fake_slaves MOCK. See epos4_network/bus.yml for the
+# full commentary.
 #
 # Separate because the master verifies slave identity (0x1018) against
 # 0x1F84/0x1F85 in the DCF, and the mock reports vendor 0x555 while a real
-# maxon drive reports 0xFB. That rejection is correct behaviour, so simulation
+# maxon drive reports 0xFB. That rejection is correct behaviour, so the mock
 # gets its own DCF rather than weakening it.
+#
+# NOT for epos4_sim. epos4_sim loads the real maxon EDS and answers with the
+# maxon identity, so it belongs on epos4_network. Pointed at this DCF, the
+# master aborts the boot with es='D' BEFORE downloading the concise DCF, the
+# simulator keeps its EDS default PDO mapping, and the master goes on decoding
+# those frames with its own mapping - which reads as plausible garbage and was
+# once misdiagnosed as Lely's BasicSlave being unable to remap.
 
 # CANopen network description, consumed by dcfgen (from lely_core_libraries).
 #

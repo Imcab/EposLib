@@ -170,3 +170,20 @@ TEST(Emergency, DescribesCodeAndRegisterTogether)
   EXPECT_NE(text.find("Thermal overload error"), std::string::npos);
   EXPECT_NE(text.find("temperature"), std::string::npos);
 }
+
+// Section 7.2.35: a lost heartbeat is only cleared by an NMT reset
+// communication followed by a fault reset. A ClearFault() that skipped the
+// first step would report the axis still faulted with no hint as to why.
+TEST(DeviceErrors, CommunicationErrorsNeedAnNmtResetBeforeTheFaultReset)
+{
+  EXPECT_TRUE(RequiresCommunicationReset(0x8130));   // CAN heartbeat error
+  EXPECT_TRUE(RequiresCommunicationReset(0x8120));   // CAN passive mode error
+}
+
+TEST(DeviceErrors, OrdinaryFaultsNeedOnlyTheFaultReset)
+{
+  EXPECT_FALSE(RequiresCommunicationReset(0x8611));  // Following error
+  EXPECT_FALSE(RequiresCommunicationReset(0x2310));  // Overcurrent error
+  EXPECT_FALSE(RequiresCommunicationReset(0x0000));  // no error
+  EXPECT_FALSE(RequiresCommunicationReset(0xABCD));  // not in the manual
+}

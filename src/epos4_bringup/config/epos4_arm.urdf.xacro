@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!-- ======================================================================
+     Minimal description of one EPOS4 axis, for bring-up.
+
+     ros2_control needs a full robot description, not only the <ros2_control>
+     block: every joint it drives has to exist as a URDF joint, or the
+     controller manager refuses to load the hardware. This file provides the
+     smallest one that satisfies that - a base and one revolute joint - so the
+     driver can be brought up before the arm's real description exists.
+
+     When the arm has its own URDF, include epos4.ros2_control.xacro from
+     there and call epos4_system with its joints instead of using this file.
+
+     The node-ID must match bus.yml, and the mechanism values below are
+     PLACEHOLDERS: put the real encoder resolution and gearbox of the axis
+     before driving anything that is attached to something.
+     ====================================================================== -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="epos4_arm">
+
+  <xacro:arg name="master_dcf" default=""/>
+  <xacro:arg name="can_interface" default="vcan0"/>
+
+  <xacro:include filename="$(find epos4_bringup)/config/epos4.ros2_control.xacro"/>
+
+  <link name="base_link"/>
+  <link name="shoulder_link"/>
+
+  <joint name="shoulder" type="revolute">
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <axis xyz="0 0 1"/>
+    <!-- Wide limits on purpose: this is a bring-up description, and the
+         position limits that protect the mechanism belong in the drive
+         (configs::LimitConfigs), which enforces them even when ROS is
+         down. -->
+    <limit lower="-3.14159" upper="3.14159" effort="100.0" velocity="2.0"/>
+  </joint>
+
+  <xacro:epos4_system name="epos4_arm"
+                      master_dcf="$(arg master_dcf)"
+                      can_interface="$(arg can_interface)">
+    <joints>
+      <xacro:epos4_joint name="shoulder"
+                         node_id="2"
+                         quadcounts_per_revolution="2000"
+                         gear_ratio="0.01"/>
+    </joints>
+  </xacro:epos4_system>
+
+</robot>

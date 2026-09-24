@@ -10,6 +10,7 @@
 
 #include "epos4/core/BusImpl.hpp"
 #include "epos4/core/Cia402StateMachine.hpp"
+#include "epos4/core/CyclicState.hpp"
 #include "epos4/hardware/Encoder.hpp"
 #include "epos4/signals/Errors.hpp"
 
@@ -89,6 +90,38 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   }
 
   // -------------------------------------------------------------------------
+  // NMT
+  // -------------------------------------------------------------------------
+
+  // Counts completed boots of this node by the master. ClearFault() compares
+  // it before and after an NMT reset to know the node is back and has been
+  // reconfigured, rather than guessing with a sleep.
+  std::atomic<unsigned> bootCount{0};
+
+  void OnBoot(lely::canopen::NmtState st, char es, const std::string & what) noexcept override
+  {
+    LoopDriver::OnBoot(st, es, what);  // keeps the default notifications
+    bootCount.fetch_add(1, std::memory_order_release);
+  }
+
+  // NMT reset communication, to this node only. The node reloads its
+  // communication objects and announces itself with a boot-up message, and
+  // the master answers that by booting it again - downloading the concise
+  // DCF, PDO mapping and heartbeat consumer included - which is what makes
+  // OnBoot() run.
+  void ResetCommunication()
+  {
+    std::promise<void> promise;
+    auto future = promise.get_future();
+    Defer(
+      [this, &promise]() {
+        master.Command(lely::canopen::NmtCommand::RESET_COMM, id());
+        promise.set_value();
+      });
+    future.get();
+  }
+
+  // -------------------------------------------------------------------------
   // PDO
   //
   // Once the master has booted the node with the mapping from the DCF, values
@@ -106,10 +139,7 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // read the values without locking, waiting or hopping threads.
   void OnRpdoWrite(std::uint16_t idx, std::uint8_t subidx) noexcept override
   {
-    pdoActive.store(true, std::memory_order_relaxed);
-    lastPdo.store(
-      std::chrono::steady_clock::now().time_since_epoch().count(),
-      std::memory_order_relaxed);
+    cyclic.RecordPdo(std::chrono::steady_clock::now());
 
     if (subidx != 0) {
       return;
@@ -121,22 +151,22 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
       switch (idx) {
         case od::cia402::kStatusword: {
             const std::uint16_t value = rpdo_mapped[idx][0];
-            cachedStatusword.store(value, std::memory_order_relaxed);
+            cyclic.RecordStatusword(value);
             break;
           }
         case od::cia402::kPositionActualValue: {
             const std::int32_t value = rpdo_mapped[idx][0];
-            cachedPosition.store(value, std::memory_order_relaxed);
+            cyclic.RecordPosition(value);
             break;
           }
         case od::cia402::kVelocityActualValue: {
             const std::int32_t value = rpdo_mapped[idx][0];
-            cachedVelocity.store(value, std::memory_order_relaxed);
+            cyclic.RecordVelocity(value);
             break;
           }
         case od::cia402::kTorqueActualValue: {
             const std::int16_t value = rpdo_mapped[idx][0];
-            cachedTorque.store(value, std::memory_order_relaxed);
+            cyclic.RecordTorque(value);
             break;
           }
         default:
@@ -154,14 +184,12 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // setpoint the control loop staged rides this cycle rather than the next.
   void OnSync(std::uint8_t, const time_point &) noexcept override
   {
-    if (!cyclicActive.load(std::memory_order_relaxed)) {
+    if (!cyclic.IsActive()) {
       return;
     }
     try {
-      tpdo_mapped[od::cia402::kControlword][0] =
-        cachedControlword.load(std::memory_order_relaxed);
-      tpdo_mapped[od::cia402::kTargetPosition][0] =
-        stagedPosition.load(std::memory_order_relaxed);
+      tpdo_mapped[od::cia402::kControlword][0] = cyclic.Controlword();
+      tpdo_mapped[od::cia402::kTargetPosition][0] = cyclic.StagedTargetPosition();
     } catch (...) {
       // Not mapped: nothing to publish. The cyclic path is only meaningful
       // with a PDO mapping, and its absence shows up as IsCyclicHealthy()
@@ -207,18 +235,31 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
     return future.get();
   }
 
-  bool PdoActive() const {return pdoActive.load(std::memory_order_relaxed);}
+  bool PdoActive() const {return cyclic.HasReceivedPdo();}
 
   // Reads over PDO when it is available and falls back to SDO otherwise, so
   // callers never have to branch on the transport.
+  //
+  // "Available" means a PDO arrived recently, not merely that one ever did.
+  // A drive that loses the master's heartbeat drops to pre-operational and
+  // stops sending PDOs, but keeps answering SDO; its last Statusword by PDO
+  // still says «Operation enabled» while it sits in «Fault». Trusting that
+  // made ClearFault() see nothing to clear and return true on a faulted
+  // axis. A stale mapped value is only a reason to ask the drive directly.
   template<typename T>
   std::error_code ReadPreferPdo(od::Entry entry, T & out)
   {
-    if (PdoActive()) {
+    if (cyclic.TimeSinceLastPdo(std::chrono::steady_clock::now()) <= kPdoFreshness) {
       if (!ReadMapped<T>(entry, out)) {return {};}
     }
     return Read<T>(entry, out);
   }
+
+  // Ten SYNC periods at the 10 ms of bus.yml. Generous enough not to fall
+  // back to SDO over jitter; short enough that a node gone quiet is asked
+  // directly almost at once. With event-driven PDOs a value may legitimately
+  // be older than this - then the read simply costs an SDO, and is right.
+  static constexpr std::chrono::milliseconds kPdoFreshness{100};
 
   std::error_code ReadStatusword(std::uint16_t & out)
   {
@@ -236,24 +277,32 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // object is not mapped at all.
   std::error_code WriteControlword()
   {
-    const od::Entry cw = od::At(od::cia402::kControlword);
-    if (!WriteMapped<std::uint16_t>(cw, controlword.Raw())) {return {};}
-    return Write<std::uint16_t>(cw, controlword.Raw());
+    // Into the copy OnSync republishes as well, or a Controlword written
+    // while the cyclic path is active - QuickStop(), Halt() - would be
+    // overwritten on the very next SYNC. See CyclicState::SetControlword.
+    cyclic.SetControlword(controlword.Raw());
+    return WriteOutput<std::uint16_t>(od::At(od::cia402::kControlword), controlword.Raw());
   }
 
-  std::atomic<bool> pdoActive{false};
-  std::atomic<long long> lastPdo{0};
+  // The same rule for every object the master may transmit, not only the
+  // Controlword. Any object mapped into an RPDO with transmission type 1 is
+  // re-sent from the master's copy on EVERY SYNC, so an SDO write to it lasts
+  // until the next SYNC and is then overwritten. For Target position under
+  // PPM that meant the drive latched 0 on «New setpoint» instead of the value
+  // just written, and the move never happened - with the handshake completing
+  // perfectly, because nothing in it checks what was latched.
+  template<typename T>
+  std::error_code WriteOutput(od::Entry entry, T value)
+  {
+    if (!WriteMapped<T>(entry, value)) {return {};}
+    return Write<T>(entry, value);
+  }
 
-  // Written by the bus thread, read by the control thread.
-  std::atomic<std::int32_t> cachedPosition{0};
-  std::atomic<std::int32_t> cachedVelocity{0};
-  std::atomic<std::int16_t> cachedTorque{0};
-  std::atomic<std::uint16_t> cachedStatusword{0};
+  // Everything the cyclic path shares between the control thread and this
+  // one: the last feedback received, the staged setpoint, and the rule for
+  // trusting them. Lock-free throughout; see core::CyclicState.
+  core::CyclicState cyclic;
 
-  // Written by the control thread, read by the bus thread on SYNC.
-  std::atomic<std::int32_t> stagedPosition{0};
-  std::atomic<std::uint16_t> cachedControlword{0};
-  std::atomic<bool> cyclicActive{false};
 
   // Makes sure the drive is in the mode a control request needs. Writing
   // 0x6060 only asks; the manual recommends confirming with 0x6061, because a
@@ -306,16 +355,25 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   signals::StatusSignal<std::uint32_t> motorRatedTorque;
   signals::StatusSignal<std::uint16_t> digitalInputPins;
 
-  std::unique_ptr<Configurator> configurator;
-  std::unique_ptr<Encoder> encoder;
 
   // Guarded because it is set from the application thread and read from the
   // CANopen thread inside OnEmcy.
   std::mutex emcyMutex;
   std::function<void(const signals::EmergencyMessage &)> emcyCallback;
 
+  // The code of the last EMCY, for readers that must not touch the bus. An
+  // EMCY with code 0 is the drive announcing that its errors were reset, so
+  // storing it as-is also clears this when the fault is cleared.
+  std::atomic<std::uint16_t> lastEmcyCode{0};
+  std::atomic<long long> lastEmcy{0};  // steady_clock ticks, 0 = never
+
   void OnEmcy(std::uint16_t eec, std::uint8_t er, std::uint8_t msef[5]) noexcept override
   {
+    lastEmcyCode.store(eec, std::memory_order_relaxed);
+    lastEmcy.store(
+      std::chrono::steady_clock::now().time_since_epoch().count(),
+      std::memory_order_relaxed);
+
     signals::EmergencyMessage message{};
     message.errorCode = eec;
     message.errorRegister = er;
@@ -490,9 +548,12 @@ namespace epos4
 // ---------------------------------------------------------------------------
 
 Epos4::Epos4(CanBus & bus, std::uint8_t nodeId)
-: nodeId_(nodeId)
+: nodeId_(nodeId),
+  configurator_(std::make_unique<Configurator>(*this)),
+  encoder_(std::make_unique<Encoder>(*this))
 {
-  // Nothing is created here: the master does not exist until CanBus::Start().
+  // Nothing that talks to the bus is created here: the master does not exist
+  // until CanBus::Start().
   // Registering now means Start() can attach this device before it resets the
   // network, which is what gets this node's PDOs routed to us.
   bus.Register(this);
@@ -505,8 +566,13 @@ Epos4::Attach(lely_master_t & master)
     return;
   }
   impl_ = std::make_unique<Impl>(master, nodeId_);
-  impl_->configurator = std::make_unique<Configurator>(*this);
-  impl_->encoder = std::make_unique<Encoder>(*this);
+  if (pendingEmcyCallback_) {
+    // Locked like any other hand-over: constructing the driver has already
+    // registered it with the master, so OnEmcy may in principle run now.
+    std::lock_guard<std::mutex> lock{impl_->emcyMutex};
+    impl_->emcyCallback = std::move(pendingEmcyCallback_);
+    pendingEmcyCallback_ = nullptr;
+  }
 
   auto & d = *impl_;
 
@@ -626,25 +692,25 @@ Epos4::GetNodeId() const
 Configurator &
 Epos4::GetConfigurator()
 {
-  return *impl_->configurator;
+  return *configurator_;
 }
 
 Encoder &
 Epos4::GetEncoder()
 {
-  return *impl_->encoder;
+  return *encoder_;
 }
 
 void
 Epos4::SetMechanism(std::uint32_t quadCountsPerRevolution, double gearRatio)
 {
-  impl_->encoder->SetMechanism(quadCountsPerRevolution, gearRatio);
+  encoder_->SetMechanism(quadCountsPerRevolution, gearRatio);
 }
 
 const MechanismScale &
 Epos4::GetMechanism() const
 {
-  return impl_->encoder->GetMechanism();
+  return encoder_->GetMechanism();
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +809,12 @@ Epos4::Disable(std::chrono::milliseconds timeout)
 bool
 Epos4::ClearFault(std::chrono::milliseconds timeout)
 {
+  if (!impl_) {
+    return false;   // the bus never started, so there is no drive to ask
+  }
   auto & d = *impl_;
+
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
 
   std::uint16_t sw{};
   if (d.ReadStatusword(sw)) {return false;}
@@ -753,13 +824,33 @@ Epos4::ClearFault(std::chrono::milliseconds timeout)
     return true;  // nothing to clear
   }
 
+  // Some faults are not cleared by the Controlword alone. For a lost
+  // heartbeat (0x8130) and CAN passive mode (0x8120) the recovery in
+  // chapter 7 is "send NMT command reset communication, then reset fault
+  // with Controlword"; without the first step the fault reset is ignored and
+  // the axis stays in «Fault» however often it is repeated.
+  std::uint16_t errorCode{};
+  if (!d.Read<std::uint16_t>(od::At(od::cia402::kErrorCode), errorCode) &&
+    signals::RequiresCommunicationReset(errorCode))
+  {
+    const unsigned bootsBefore = d.bootCount.load(std::memory_order_acquire);
+    d.ResetCommunication();
+
+    // Wait for the master to have booted the node again: until then its PDO
+    // mapping and heartbeat consumer are the power-on defaults, and an SDO
+    // to it fails with "SDO connection not available".
+    while (d.bootCount.load(std::memory_order_acquire) == bootsBefore) {
+      if (std::chrono::steady_clock::now() >= deadline) {return false;}
+      std::this_thread::sleep_for(kPollInterval);
+    }
+  }
+
   // Table 2-7: Fault reset is the rising edge of bit 7, not its level.
   // Controlword::Apply lowers bit 7 first, so applying kFaultReset and then
   // any other command produces 0->1->0 without the caller tracking it.
   d.controlword.Apply(core::Command::kFaultReset);
   if (d.WriteControlword()) {return false;}
 
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(kPollInterval);
     if (d.ReadStatusword(sw)) {return false;}
@@ -852,7 +943,9 @@ Epos4::SetControl(const controls::ProfilePosition & request)
         od::At(od::cia402::kProfileDeceleration), *request.deceleration)) {return ec;}
   }
 
-  if (auto ec = d.Write<std::int32_t>(
+  // Before raising «New setpoint», and through the RPDO when Target position
+  // is mapped: see WriteOutput for why an SDO write here is lost.
+  if (auto ec = d.WriteOutput<std::int32_t>(
       od::At(od::cia402::kTargetPosition), targetCounts)) {return ec;}
 
   // Mode bits, before the handshake so they are in force when the setpoint is
@@ -920,10 +1013,11 @@ Epos4::SetControl(const controls::ProfileVelocity & request)
   }
 
   // PVM has no setpoint handshake: the target velocity takes effect as soon
-  // as it is written. And no PDO path either - a profiled move is commanded
-  // once and the drive generates the ramp, so there is nothing cyclic to
-  // stage. That belongs to CyclicVelocity below.
-  return d.Write<std::int32_t>(od::At(od::cia402::kTargetVelocity), targetRpm);
+  // as it arrives. It is commanded once and the drive generates the ramp, so
+  // nothing here is cyclic - but if Target velocity is mapped into an RPDO the
+  // write still has to go through it, or the next SYNC resets it to whatever
+  // the master's copy holds. See WriteOutput.
+  return d.WriteOutput<std::int32_t>(od::At(od::cia402::kTargetVelocity), targetRpm);
 }
 
 std::error_code
@@ -949,9 +1043,7 @@ Epos4::SetControl(const controls::CyclicPosition & request)
   // The cyclic modes exist to be commanded every cycle. Staging the setpoint
   // in the RPDO lets it ride the next SYNC instead of costing an SDO round
   // trip per update.
-  const od::Entry target = od::At(od::cia402::kTargetPosition);
-  if (auto ec = d.WriteMapped<std::int32_t>(target, targetCounts); !ec) {return {};}
-  return d.Write<std::int32_t>(target, targetCounts);
+  return d.WriteOutput<std::int32_t>(od::At(od::cia402::kTargetPosition), targetCounts);
 }
 
 std::error_code
@@ -977,9 +1069,7 @@ Epos4::SetControl(const controls::CyclicVelocity & request)
   // The cyclic modes exist to be commanded every cycle. Staging the setpoint
   // in the RPDO lets it ride the next SYNC instead of costing an SDO round
   // trip per update.
-  const od::Entry target = od::At(od::cia402::kTargetVelocity);
-  if (auto ec = d.WriteMapped<std::int32_t>(target, targetRpm); !ec) {return {};}
-  return d.Write<std::int32_t>(target, targetRpm);
+  return d.WriteOutput<std::int32_t>(od::At(od::cia402::kTargetVelocity), targetRpm);
 }
 
 std::error_code
@@ -996,9 +1086,7 @@ Epos4::SetControl(const controls::CyclicTorque & request)
   // The cyclic modes exist to be commanded every cycle. Staging the setpoint
   // in the RPDO lets it ride the next SYNC instead of costing an SDO round
   // trip per update.
-  const od::Entry target = od::At(od::cia402::kTargetTorque);
-  if (auto ec = d.WriteMapped<std::int16_t>(target, request.torque); !ec) {return {};}
-  return d.Write<std::int16_t>(target, request.torque);
+  return d.WriteOutput<std::int16_t>(od::At(od::cia402::kTargetTorque), request.torque);
 }
 
 std::error_code
@@ -1156,13 +1244,22 @@ namespace epos4
 bool
 Epos4::IsPdoActive() const
 {
-  return impl_->PdoActive();
+  return impl_ && impl_->PdoActive();
 }
 
 std::chrono::steady_clock::duration
 Epos4::GetTimeSinceLastPdo() const
 {
-  const auto last = impl_->lastPdo.load(std::memory_order_relaxed);
+  if (!impl_) {
+    return std::chrono::steady_clock::duration::max();
+  }
+  return impl_->cyclic.TimeSinceLastPdo(std::chrono::steady_clock::now());
+}
+
+std::chrono::steady_clock::duration
+Epos4::GetTimeSinceLastEmergency() const
+{
+  const long long last = impl_ ? impl_->lastEmcy.load(std::memory_order_relaxed) : 0;
   if (last == 0) {
     return std::chrono::steady_clock::duration::max();
   }
@@ -1238,7 +1335,11 @@ Epos4::ClearErrorHistory()
 void
 Epos4::SetEmergencyCallback(std::function<void(const signals::EmergencyMessage &)> callback)
 {
+  // Before Start() there is no Impl yet, and devices are declared before
+  // Start(), so this is exactly when a caller registers the callback. It used
+  // to be dropped here without a word; keep it until Attach() instead.
   if (!impl_) {
+    pendingEmcyCallback_ = std::move(callback);
     return;
   }
   std::lock_guard<std::mutex> lock{impl_->emcyMutex};
@@ -1359,14 +1460,9 @@ Epos4::EnterCyclicPositionMode()
   if (auto ec = d.Read<std::int32_t>(od::At(od::cia402::kPositionActualValue), position)) {
     return ec;
   }
-  d.stagedPosition.store(position, std::memory_order_relaxed);
-  d.cachedPosition.store(position, std::memory_order_relaxed);
-
   // The Controlword published on every SYNC is whatever the state machine
   // last built, so an axis that was enabled stays enabled.
-  d.cachedControlword.store(d.controlword.Raw(), std::memory_order_relaxed);
-
-  d.cyclicActive.store(true, std::memory_order_relaxed);
+  d.cyclic.Activate(position, d.controlword.Raw());
   return {};
 }
 
@@ -1374,64 +1470,58 @@ void
 Epos4::ExitCyclicMode()
 {
   if (impl_) {
-    impl_->cyclicActive.store(false, std::memory_order_relaxed);
+    impl_->cyclic.Deactivate();
   }
 }
 
 bool
 Epos4::IsCyclicModeActive() const
 {
-  return impl_ && impl_->cyclicActive.load(std::memory_order_relaxed);
+  return impl_ && impl_->cyclic.IsActive();
 }
 
 std::int32_t
 Epos4::GetCachedPosition() const
 {
-  return impl_ ? impl_->cachedPosition.load(std::memory_order_relaxed) : 0;
+  return impl_ ? impl_->cyclic.Position() : 0;
 }
 
 std::int32_t
 Epos4::GetCachedVelocity() const
 {
-  return impl_ ? impl_->cachedVelocity.load(std::memory_order_relaxed) : 0;
+  return impl_ ? impl_->cyclic.Velocity() : 0;
 }
 
 std::int16_t
 Epos4::GetCachedTorque() const
 {
-  return impl_ ? impl_->cachedTorque.load(std::memory_order_relaxed) : 0;
+  return impl_ ? impl_->cyclic.Torque() : 0;
 }
 
 std::uint16_t
 Epos4::GetCachedStatusword() const
 {
-  return impl_ ? impl_->cachedStatusword.load(std::memory_order_relaxed) : 0;
+  return impl_ ? impl_->cyclic.Statusword() : 0;
+}
+
+std::uint16_t
+Epos4::GetCachedErrorCode() const
+{
+  return impl_ ? impl_->lastEmcyCode.load(std::memory_order_relaxed) : 0;
 }
 
 void
 Epos4::StageTargetPosition(std::int32_t quadCounts)
 {
   if (impl_) {
-    impl_->stagedPosition.store(quadCounts, std::memory_order_relaxed);
+    impl_->cyclic.StageTargetPosition(quadCounts);
   }
 }
 
 bool
 Epos4::IsCyclicHealthy(std::chrono::steady_clock::duration maxAge) const
 {
-  if (!impl_ || !impl_->cyclicActive.load(std::memory_order_relaxed)) {
-    return false;
-  }
-
-  // Stale data is the failure this catches. When the bus goes quiet the
-  // cached values stop changing but keep reading back happily, so without an
-  // age check a controller would go on believing a dead axis is tracking.
-  if (GetTimeSinceLastPdo() > maxAge) {
-    return false;
-  }
-
-  const auto state = core::Decode(GetCachedStatusword());
-  return state && *state == signals::State::kOperationEnabled;
+  return impl_ && impl_->cyclic.IsHealthy(maxAge, std::chrono::steady_clock::now());
 }
 
 }  // namespace epos4

@@ -1,6 +1,7 @@
 #include "epos4/signals/Errors.hpp"
 
 #include <cstdio>
+#include <string_view>
 
 namespace epos4::signals
 {
@@ -1147,6 +1148,23 @@ ClearsPosition(std::uint16_t code)
 {
   const DeviceError * e = FindDeviceError(code);
   return e != nullptr && e->clearsPosition;
+}
+
+bool
+RequiresCommunicationReset(std::uint16_t code)
+{
+  const DeviceError * e = FindDeviceError(code);
+  if (e == nullptr) {
+    return false;
+  }
+  for (std::size_t i = 0; i < e->recoveryCount; ++i) {
+    if (std::string_view{e->recovery[i]}.find("NMT command reset communication") !=
+      std::string_view::npos)
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string

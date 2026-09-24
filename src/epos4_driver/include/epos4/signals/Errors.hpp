@@ -97,6 +97,13 @@ bool IsWarning(std::uint16_t code);
 // True when resetting this error clears the position, i.e. homing is lost.
 bool ClearsPosition(std::uint16_t code);
 
+// True when the manual's recovery for this error starts with an NMT reset
+// communication, before the fault reset. For those a Controlword fault reset
+// alone does nothing: the drive stays in «Fault». Derived from the recovery
+// text transcribed from chapter 7 rather than kept as a separate list, so
+// the two cannot drift apart. Today that is 0x8120 and 0x8130.
+bool RequiresCommunicationReset(std::uint16_t code);
+
 // Decodes the 0x1001 byte into names.
 std::string DescribeErrorRegister(std::uint8_t value);
 

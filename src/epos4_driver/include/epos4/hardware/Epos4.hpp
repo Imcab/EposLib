@@ -166,7 +166,13 @@ public:
   // physical failure, and re-enabling on its own means pushing against
   // whatever caused it. Returns false if the fault condition is still present,
   // which the drive reports by faulting again immediately.
-  bool ClearFault(std::chrono::milliseconds timeout = std::chrono::milliseconds{1000});
+  //
+  // For the communication faults whose recovery in chapter 7 starts with an
+  // NMT reset communication (signals::RequiresCommunicationReset: a lost
+  // heartbeat, CAN passive mode) that reset is sent first and the node is
+  // waited for until the master has booted it again. The timeout covers the
+  // whole sequence, which is why it is longer than a fault reset needs.
+  bool ClearFault(std::chrono::milliseconds timeout = std::chrono::milliseconds{3000});
 
   // Stops motion while staying enabled (Controlword bit 8). Different from
   // QuickStop, which leaves the state machine, and from Disable, which cuts
@@ -367,6 +373,17 @@ public:
   std::int16_t GetCachedTorque() const;      // 0x6077 [per thousand of rated]
   std::uint16_t GetCachedStatusword() const;  // 0x6041
 
+  // The error code of the last EMCY the drive sent, 0 if none or if the
+  // drive has since announced an error reset. Arrives unsolicited, so unlike
+  // GetErrorCode() (0x603F, an SDO read) it costs nothing and still answers
+  // when the node has gone silent - which is when it is most needed.
+  std::uint16_t GetCachedErrorCode() const;
+
+  // When that EMCY arrived; duration::max() if none ever did. A code without
+  // its age is misleading: an EMCY from the boot sequence, minutes earlier,
+  // would read as the cause of whatever just happened.
+  std::chrono::steady_clock::duration GetTimeSinceLastEmergency() const;
+
   // Stages the next target position. It goes out on the following SYNC.
   // Lock-free, and safe to call from a different thread than the bus.
   void StageTargetPosition(std::int32_t quadCounts);
@@ -403,6 +420,9 @@ public:
   //
   // The callback runs on the CANopen thread: keep it short, do not block,
   // and do not call back into this device from it.
+  //
+  // May be called before CanBus::Start(); the callback is kept and installed
+  // when the bus attaches the device.
   void SetEmergencyCallback(std::function<void(const signals::EmergencyMessage &)> callback);
 
   // -------------------------------------------------------------------------
@@ -430,6 +450,19 @@ private:
   void Attach(lely_master_t & master);
 
   std::uint8_t nodeId_{0};
+
+  // Owned by the device, not by Impl, and created in the constructor rather
+  // than in Attach(). Neither touches the bus when constructed, and both are
+  // needed BEFORE CanBus::Start(): the mechanism in particular has to be set
+  // on a device that must be declared before the bus starts. Kept in Impl
+  // they did not exist yet, and SetMechanism() dereferenced a null pointer.
+  std::unique_ptr<Configurator> configurator_;
+  std::unique_ptr<Encoder> encoder_;
+
+  // An emergency callback registered before Start(), handed to Impl in
+  // Attach(). See SetEmergencyCallback().
+  std::function<void(const signals::EmergencyMessage &)> pendingEmcyCallback_;
+
   std::unique_ptr<Impl> impl_;
 };
 
