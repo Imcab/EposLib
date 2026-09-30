@@ -382,6 +382,15 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // subsequent command would be interpreted by the wrong mode.
   std::error_code EnsureMode(signals::OperationMode mode)
   {
+    // A mode the drive does not implement is refused here, by name, instead
+    // of being written and then timing out waiting for 0x6061 to follow.
+    if (static_cast<int>(mode) >= 1) {
+      if (const auto modes = SupportedDriveModes();
+        modes && !signals::SupportsMode(*modes, mode))
+      {
+        return std::make_error_code(std::errc::not_supported);
+      }
+    }
     std::int8_t active{};
     auto ec = Read<std::int8_t>(od::At(od::cia402::kModesOfOperationDisplay), active);
     if (ec) {return ec;}
@@ -434,6 +443,63 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   signals::StatusSignal<std::uint16_t> digitalInputPins;
   signals::StatusSignal<std::uint32_t> digitalOutputs;
   signals::StatusSignal<std::uint16_t> digitalOutputPins;
+
+  signals::StatusSignal<std::int16_t> torqueAveraged;
+  signals::StatusSignal<std::int32_t> velocityAveraged;
+  signals::StatusSignal<signals::CanBitRate> canBitRate;
+  signals::StatusSignal<signals::Fieldbus> activeFieldbus;
+  signals::StatusSignal<std::uint32_t> supportedDriveModes;
+  signals::StatusSignal<units::voltage::volt_t> analogInputVoltage[2];
+  signals::StatusSignal<units::voltage::volt_t> analogInputGeneralPurpose[2];
+  signals::StatusSignal<units::voltage::volt_t> analogOutputVoltage[2];
+
+  // What the drive can do, read once: they are constants of the firmware.
+  // Guarded because EnsureMode() and Home() may be called from several
+  // application threads.
+  std::mutex capabilitiesMutex;
+  std::optional<std::uint32_t> knownDriveModes;
+  std::optional<std::vector<std::int8_t>> knownHomingMethods;
+
+  // «Supported drive modes» (0x6502), or nullopt when it cannot be read -
+  // callers then skip the check rather than refuse a mode on a guess.
+  std::optional<std::uint32_t> SupportedDriveModes()
+  {
+    std::lock_guard<std::mutex> lock{capabilitiesMutex};
+    if (!knownDriveModes) {
+      std::uint32_t modes{};
+      // Zero is no information, not "supports nothing": no CiA 402 drive
+      // implements no mode. Treated as unknown, so nothing gets refused on
+      // it - the first run of this check against a simulator reporting 0
+      // refused every mode and left the axis unable to move.
+      if (!Read(od::At(od::cia402::kSupportedDriveModes), modes) && modes != 0) {
+        knownDriveModes = modes;
+      }
+    }
+    return knownDriveModes;
+  }
+
+  // «Supported homing methods» (0x60E3): subindex 0 holds how many follow.
+  std::optional<std::vector<std::int8_t>> SupportedHomingMethods()
+  {
+    std::lock_guard<std::mutex> lock{capabilitiesMutex};
+    if (!knownHomingMethods) {
+      std::uint8_t count{};
+      if (!Read(od::At(od::cia402::kSupportedHomingMethods, 0), count)) {
+        std::vector<std::int8_t> methods;
+        bool complete = true;
+        for (std::uint8_t sub = 1; sub <= count && complete; ++sub) {
+          std::int8_t method{};
+          complete = !Read(od::At(od::cia402::kSupportedHomingMethods, sub), method);
+          methods.push_back(method);
+        }
+        // All zeros is the same non-answer: 0 is not a homing method.
+        bool informative = false;
+        for (auto m : methods) {informative = informative || m != 0;}
+        if (complete && informative) {knownHomingMethods = methods;}
+      }
+    }
+    return knownHomingMethods;
+  }
 
   signals::StatusSignal<units::current::ampere_t> motorCurrent;
   signals::StatusSignal<units::current::ampere_t> motorCurrentAveraged;
@@ -744,6 +810,55 @@ Epos4::Attach(lely_master_t & master)
     celsius(od::maxon::kThermalOverloadProtection_TemperaturePowerStage));
   // UNSIGNED16 on the drive, read into a signed one: the limit is a few
   // hundred tenths of a degree, far inside either range.
+  d.torqueAveraged =
+    signals::StatusSignal<std::int16_t>(
+    [&d](std::int16_t & out) {
+      return d.ReadPreferPdo<std::int16_t>(
+        od::maxon::kTorqueActualValues_TorqueActualValueAveraged, out);
+    });
+  d.velocityAveraged =
+    signals::StatusSignal<std::int32_t>(
+    [&d](std::int32_t & out) {
+      return d.ReadPreferPdo<std::int32_t>(
+        od::maxon::kVelocityActualValues_VelocityActualValueAveraged, out);
+    });
+  d.canBitRate = signals::StatusSignal<signals::CanBitRate>(
+    [&d](signals::CanBitRate & out) {
+      std::uint8_t raw{};
+      auto ec = d.Read(od::At(od::maxon_comm::kCANBitRateDisplay), raw);
+      if (!ec) {out = static_cast<signals::CanBitRate>(raw);}
+      return ec;
+    });
+  d.activeFieldbus = signals::StatusSignal<signals::Fieldbus>(
+    [&d](signals::Fieldbus & out) {
+      std::uint8_t raw{};
+      auto ec = d.Read(od::At(od::maxon_comm::kActiveFieldbus), raw);
+      if (!ec) {out = static_cast<signals::Fieldbus>(raw);}
+      return ec;
+    });
+  d.supportedDriveModes = signals::StatusSignal<std::uint32_t>(
+    [&d](std::uint32_t & out) {
+      return d.Read(od::At(od::cia402::kSupportedDriveModes), out);
+    });
+  // The analog objects are all in mV, INTEGER16 (6.2.79, 6.2.81, 6.2.85).
+  auto millivolts = [&d](od::Entry entry) {
+      return [&d, entry](units::voltage::volt_t & out) {
+               std::int16_t mv{};
+               auto ec = d.ReadPreferPdo<std::int16_t>(entry, mv);
+               if (!ec) {out = units::voltage::millivolt_t{static_cast<double>(mv)};}
+               return ec;
+             };
+    };
+  for (std::uint8_t i = 0; i < 2; ++i) {
+    const std::uint8_t sub = i + 1;
+    d.analogInputVoltage[i] = signals::StatusSignal<units::voltage::volt_t>(
+      millivolts(od::At(od::maxon::kAnalogInputProperties, sub)));
+    d.analogInputGeneralPurpose[i] = signals::StatusSignal<units::voltage::volt_t>(
+      millivolts(od::At(od::maxon::kAnalogInputGeneralPurpose, sub)));
+    d.analogOutputVoltage[i] = signals::StatusSignal<units::voltage::volt_t>(
+      millivolts(od::At(od::maxon::kAnalogOutputProperties, sub)));
+  }
+
   d.powerStageTemperatureLimit = signals::StatusSignal<units::temperature::celsius_t>(
     [&d](units::temperature::celsius_t & out) {
       std::uint16_t decidegrees{};
@@ -1354,6 +1469,15 @@ Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
   if (d.EnsureMode(controls::Homing::kMode)) {return false;}
 
   if (request.method) {
+    // A method the firmware does not list in 0x60E3 is refused up front.
+    if (const auto methods = d.SupportedHomingMethods()) {
+      bool listed = false;
+      for (auto m : *methods) {
+        listed = listed || m == static_cast<std::int8_t>(*request.method);
+      }
+      if (!listed) {return false;}
+    }
+
     // Check the switch BEFORE anything moves. A homing run whose switch is
     // not mapped in 0x3142 does not fail fast: the axis drives until it hits
     // something mechanical or the timeout expires, which on an arm means
@@ -1460,6 +1584,69 @@ signals::StatusSignal<units::temperature::celsius_t> & Epos4::GetPowerStageTempe
 signals::StatusSignal<units::temperature::celsius_t> & Epos4::GetPowerStageTemperatureLimit()
 {
   return impl_->powerStageTemperatureLimit;
+}
+signals::StatusSignal<std::int16_t> & Epos4::GetTorqueAveraged() {return impl_->torqueAveraged;}
+signals::StatusSignal<std::int32_t> & Epos4::GetVelocityAveraged() {return impl_->velocityAveraged;}
+signals::StatusSignal<signals::CanBitRate> & Epos4::GetCanBitRate() {return impl_->canBitRate;}
+signals::StatusSignal<signals::Fieldbus> & Epos4::GetActiveFieldbus()
+{
+  return impl_->activeFieldbus;
+}
+signals::StatusSignal<std::uint32_t> & Epos4::GetSupportedDriveModes()
+{
+  return impl_->supportedDriveModes;
+}
+signals::StatusSignal<units::voltage::volt_t> &
+Epos4::GetAnalogInputVoltage(signals::AnalogInput input)
+{
+  return impl_->analogInputVoltage[static_cast<std::uint8_t>(input) - 1];
+}
+signals::StatusSignal<units::voltage::volt_t> &
+Epos4::GetAnalogInputGeneralPurpose(signals::AnalogGeneralPurpose value)
+{
+  return impl_->analogInputGeneralPurpose[static_cast<std::uint8_t>(value) - 1];
+}
+signals::StatusSignal<units::voltage::volt_t> &
+Epos4::GetAnalogOutputVoltage(signals::AnalogOutput output)
+{
+  return impl_->analogOutputVoltage[static_cast<std::uint8_t>(output) - 1];
+}
+
+std::error_code
+Epos4::SetAnalogOutput(signals::AnalogGeneralPurpose output, units::voltage::volt_t voltage)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  // 0x3182 is in mV, INTEGER32, and 6.2.87 gives the range as +-4000 mV.
+  // Refused beyond it rather than clamped: an output that silently does
+  // not reach what was asked for is worse than an error.
+  const double mv = units::voltage::millivolt_t{voltage}.value();
+  if (mv < -4000.0 || mv > 4000.0) {
+    return std::make_error_code(std::errc::argument_out_of_domain);
+  }
+  const auto value = static_cast<std::int32_t>(mv < 0.0 ? mv - 0.5 : mv + 0.5);
+  return impl_->WriteOutput<std::int32_t>(
+    od::At(od::maxon::kAnalogOutputGeneralPurpose, static_cast<std::uint8_t>(output)), value);
+}
+
+bool
+Epos4::SupportsMode(signals::OperationMode mode)
+{
+  if (!impl_) {return false;}
+  const auto modes = impl_->SupportedDriveModes();
+  return modes && signals::SupportsMode(*modes, mode);
+}
+
+std::error_code
+Epos4::GetSupportedHomingMethods(std::vector<signals::HomingMethod> & out)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  const auto methods = impl_->SupportedHomingMethods();
+  if (!methods) {return std::make_error_code(std::errc::io_error);}
+  out.clear();
+  for (auto m : *methods) {
+    out.push_back(static_cast<signals::HomingMethod>(m));
+  }
+  return {};
 }
 signals::StatusSignal<std::uint16_t> & Epos4::GetErrorCode() {return impl_->errorCode;}
 signals::StatusSignal<std::uint8_t> & Epos4::GetErrorRegister() {return impl_->errorRegister;}
@@ -1670,6 +1857,13 @@ Epos4::GetIdentity(signals::DeviceIdentity & out)
   if (auto ec = d.Read(od::comm::kIdentityObject_SerialNumber, identity.serialNumber)) {
     return ec;
   }
+  // Best effort beyond 0x1018: a firmware without one of these leaves that
+  // field at its default rather than failing the identity as a whole.
+  d.Read(od::At(od::comm::kDeviceType), identity.deviceType);
+  d.Read(od::At(od::comm::kManufacturerDeviceName), identity.deviceName);
+  d.Read(od::maxon_comm::kAdditionalIdentity_SerialNumberComplete, identity.serialNumberComplete);
+  d.Read(od::comm::kProgramSoftwareIdentification_ProgramNumber1, identity.programSoftware);
+  d.Read(od::comm::kFlashStatusIdentification_ProgramNumber1, identity.flashStatus);
   out = identity;
   return {};
 }

@@ -292,4 +292,31 @@ ToString(MotorType value)
   return "unknown";
 }
 
+const char *
+ToString(Fieldbus value)
+{
+  switch (value) {
+    case Fieldbus::kNone: return "none";
+    case Fieldbus::kCanOpen: return "CANopen";
+    case Fieldbus::kEtherCat: return "EtherCAT";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(CanBitRate value)
+{
+  switch (value) {
+    case CanBitRate::k1Mbit: return "1 Mbit/s";
+    case CanBitRate::k800kbit: return "800 kbit/s";
+    case CanBitRate::k500kbit: return "500 kbit/s";
+    case CanBitRate::k250kbit: return "250 kbit/s";
+    case CanBitRate::k125kbit: return "125 kbit/s";
+    case CanBitRate::k50kbit: return "50 kbit/s";
+    case CanBitRate::k20kbit: return "20 kbit/s";
+    case CanBitRate::kAutomatic: return "automatic detection";
+  }
+  return "unknown";
+}
+
 }  // namespace epos4::signals

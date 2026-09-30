@@ -52,11 +52,12 @@ Describe(const DeviceIdentity & identity)
   }
 
   const char * hardware = HardwareName(identity.HardwareVersion());
-  char buffer[160];
+  char buffer[200];
   std::snprintf(
-    buffer, sizeof(buffer), "%s, firmware %s, serial %08u",
+    buffer, sizeof(buffer), "%s, firmware %s, serial %08u%s",
     hardware ? hardware : "unknown maxon hardware (not in Table 6-66)",
-    FirmwareName(identity).c_str(), static_cast<unsigned>(identity.serialNumber));
+    FirmwareName(identity).c_str(), static_cast<unsigned>(identity.serialNumber),
+    identity.IsProgramValid() ? "" : ", FIRMWARE NOT VALID (flash status)");
   return buffer;
 }
 

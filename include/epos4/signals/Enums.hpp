@@ -413,4 +413,53 @@ enum class AbortConnectionOption : std::int16_t
 
 const char * ToString(AbortConnectionOption value);
 
+
+// «Supported drive modes» (0x6502, section 6.2.151) is a CiA 402 bit field:
+// bit (mode - 1) set means the drive implements that mode. The EPOS4's
+// 0x000003A5 is the six this library drives: PPM, PVM, HMM, CSP, CSV, CST.
+constexpr bool
+SupportsMode(std::uint32_t supportedDriveModes, OperationMode mode)
+{
+  const int m = static_cast<int>(mode);
+  return m >= 1 && m <= 32 && ((supportedDriveModes >> (m - 1)) & 1u) != 0;
+}
+
+
+// «Active fieldbus», 0x2010, Table 6-96.
+enum class Fieldbus : std::uint8_t
+{
+  kNone = 0,
+  kCanOpen = 1,
+  kEtherCat = 2,
+};
+
+const char * ToString(Fieldbus value);
+
+
+// «CAN bit rate» (0x2001) and «CAN bit rate display» (0x200A), Table 6-94.
+// 5 is reserved and 8 (10 kbit/s) not supported, so neither is listed.
+enum class CanBitRate : std::uint8_t
+{
+  k1Mbit = 0,
+  k800kbit = 1,
+  k500kbit = 2,
+  k250kbit = 3,
+  k125kbit = 4,
+  k50kbit = 6,
+  k20kbit = 7,
+  kAutomatic = 9,  // detect from the bus traffic, after save and restart
+};
+
+const char * ToString(CanBitRate value);
+
+
+// The analog channels, by their subindex in 0x3160 (input voltage), 0x3180
+// (output voltage) and 0x3161 / 0x3181 (configuration).
+enum class AnalogInput : std::uint8_t {k1 = 1, k2 = 2};
+enum class AnalogOutput : std::uint8_t {k1 = 1, k2 = 2};
+
+// The general purpose values, by their subindex in 0x3162 (inputs) and
+// 0x3182 (outputs): whichever channel is configured as A or B.
+enum class AnalogGeneralPurpose : std::uint8_t {kA = 1, kB = 2};
+
 }  // namespace epos4::signals

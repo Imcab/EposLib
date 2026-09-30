@@ -63,6 +63,17 @@ Encoder::Encoder(Epos4 & device)
     u32(od::maxon::kSSIAbsoluteEncoder_SSIPositionRawValue));
   mainSensorResolution_ = signals::StatusSignal<std::uint32_t>(
     u32(od::maxon::kAxisConfiguration_MainSensorResolution));
+
+  // Slot n is subindex n of 0x60E4 and 0x60E5; the averaged velocities sit
+  // at 0x60E5:09..0B (section 6.2.145).
+  for (std::uint8_t i = 0; i < 3; ++i) {
+    sensorPosition_[i] = signals::StatusSignal<std::int32_t>(
+      i32(od::cia402::kAdditionalPositionActualValues, i + 1));
+    sensorVelocity_[i] = signals::StatusSignal<std::int32_t>(
+      i32(od::cia402::kAdditionalVelocityActualValues, i + 1));
+    sensorVelocityAveraged_[i] = signals::StatusSignal<std::int32_t>(
+      i32(od::cia402::kAdditionalVelocityActualValues, i + 9));
+  }
 }
 
 std::error_code
@@ -162,6 +173,24 @@ signals::StatusSignal<std::uint32_t> &
 Encoder::GetMainSensorResolution()
 {
   return mainSensorResolution_;
+}
+
+signals::StatusSignal<std::int32_t> &
+Encoder::GetSensorPosition(configs::SensorSlot slot)
+{
+  return sensorPosition_[static_cast<std::uint8_t>(slot) - 1];
+}
+
+signals::StatusSignal<std::int32_t> &
+Encoder::GetSensorVelocity(configs::SensorSlot slot)
+{
+  return sensorVelocity_[static_cast<std::uint8_t>(slot) - 1];
+}
+
+signals::StatusSignal<std::int32_t> &
+Encoder::GetSensorVelocityAveraged(configs::SensorSlot slot)
+{
+  return sensorVelocityAveraged_[static_cast<std::uint8_t>(slot) - 1];
 }
 
 }  // namespace epos4

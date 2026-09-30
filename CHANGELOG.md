@@ -18,6 +18,27 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Added
 
+- More feedback: `GetTorqueAveraged()` and `GetVelocityAveraged()`
+  (0x30D2, 0x30D3), and per-sensor position and velocity on the encoder
+  subsystem - `GetSensorPosition()`, `GetSensorVelocity()`,
+  `GetSensorVelocityAveraged()` (0x60E4, 0x60E5).
+- Analog I/O: `GetAnalogInputVoltage()`, `GetAnalogInputGeneralPurpose()`,
+  `GetAnalogOutputVoltage()` in volts, and `SetAnalogOutput()`, refused
+  beyond the +-4 V of section 6.2.87 rather than clamped.
+- Capabilities: `GetSupportedDriveModes()` / `SupportsMode()` (0x6502) and
+  `GetSupportedHomingMethods()` (0x60E3). `SetControl()` now refuses a mode
+  the drive does not implement with `not_supported`, and `Home()` a method
+  it does not list, before anything is written. A drive answering 0 or an
+  all-zero list is treated as unknown and nothing is refused on it.
+- `GetCanBitRate()` (0x200A, the rate in use) and `GetActiveFieldbus()`.
+- `DeviceIdentity` also carries the device type (0x1000), the device name
+  (0x1008), the full 64-bit serial number (0x2100), the program software
+  identification (0x1F56) and the flash status (0x1F57); `Describe()`
+  calls out firmware whose flash status is not "valid program available".
+- `epos4_sim` fills in the values a drive computes and the EDS leaves
+  empty, from the specification's defaults, and models analog I/O and the
+  per-sensor feedback.
+
 - `SetPosition(position)`: declares the axis to be somewhere without moving
   it - homing method 37, «Actual position», with the Home offset move
   distance zeroed for the run. The homing method, 0x30B0, 0x30B1 and the

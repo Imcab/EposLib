@@ -352,6 +352,49 @@ public:
   signals::StatusSignal<units::temperature::celsius_t> & GetPowerStageTemperatureLimit();
 
   // -------------------------------------------------------------------------
+  // More feedback
+  // -------------------------------------------------------------------------
+
+  // Torque and velocity actual through a first-order low-pass (0x30D2:01,
+  // 50 Hz; 0x30D3:01, 5 Hz) - for display and logging, where the raw
+  // values are mostly noise. Same units as GetTorque() / GetVelocity().
+  signals::StatusSignal<std::int16_t> & GetTorqueAveraged();
+  signals::StatusSignal<std::int32_t> & GetVelocityAveraged();
+
+  // Analog inputs (6.2.79, 6.2.81): the voltage at each input, and the
+  // general purpose value A/B - whichever input AnalogInputConfigs assigns
+  // to it. Analog outputs (6.2.85): the voltage actually output.
+  signals::StatusSignal<units::voltage::volt_t> & GetAnalogInputVoltage(signals::AnalogInput input);
+  signals::StatusSignal<units::voltage::volt_t> & GetAnalogInputGeneralPurpose(
+    signals::AnalogGeneralPurpose value);
+  signals::StatusSignal<units::voltage::volt_t> & GetAnalogOutputVoltage(
+    signals::AnalogOutput output);
+
+  // Sets the general purpose analog output A or B (0x3182), for whichever
+  // output is configured as that in 0x3181. +-4 V (section 6.2.87);
+  // argument_out_of_domain beyond, rather than a silent clamp.
+  std::error_code SetAnalogOutput(
+    signals::AnalogGeneralPurpose output, units::voltage::volt_t voltage);
+
+  // -------------------------------------------------------------------------
+  // Communication and capabilities
+  // -------------------------------------------------------------------------
+
+  // The CAN bit rate actually in use (0x200A) - different from the
+  // configured one when automatic detection is active - and the fieldbus.
+  signals::StatusSignal<signals::CanBitRate> & GetCanBitRate();
+  signals::StatusSignal<signals::Fieldbus> & GetActiveFieldbus();
+
+  // «Supported drive modes» (0x6502). SetControl() already refuses a mode
+  // the drive does not list, with not_supported; this is for asking first.
+  signals::StatusSignal<std::uint32_t> & GetSupportedDriveModes();
+  bool SupportsMode(signals::OperationMode mode);
+
+  // «Supported homing methods» (0x60E3), in the drive's order. Home()
+  // refuses a method missing from it.
+  std::error_code GetSupportedHomingMethods(std::vector<signals::HomingMethod> & out);
+
+  // -------------------------------------------------------------------------
   // Digital inputs
   //
   // Two views of the same pins, and the difference matters:

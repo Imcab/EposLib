@@ -81,3 +81,40 @@ TEST(Identity, FlagsADeviceFromAnotherVendor)
   EXPECT_FALSE(identity.IsMaxon());
   EXPECT_NE(Describe(identity).find("not a maxon device"), std::string::npos);
 }
+
+// Section 6.2.1: 0x00020192 is a CiA 402 (0x0192) servo drive (2).
+TEST(Identity, DeviceTypeSplitsIntoProfileAndDriveType)
+{
+  DeviceIdentity identity = TheDriveInTheEds();
+  identity.deviceType = 0x00020192;
+  EXPECT_EQ(identity.DeviceProfile(), 402);
+  EXPECT_EQ(identity.DriveType(), 2);
+}
+
+// Table 6-92: application in the high word, bootloader in the low one.
+TEST(Identity, ProgramSoftwareSplitsIntoApplicationAndBootloader)
+{
+  DeviceIdentity identity = TheDriveInTheEds();
+  identity.programSoftware = 0x01700012;
+  EXPECT_EQ(identity.ApplicationProgram(), 0x0170);
+  EXPECT_EQ(identity.BootloaderProgram(), 0x0012);
+}
+
+// Table 6-93: 0 is "valid program available"; a download in progress (bit
+// 0) or any error code (bits 7..1) is not, and the description says so.
+TEST(Identity, AnInvalidFlashStatusIsCalledOut)
+{
+  DeviceIdentity identity = TheDriveInTheEds();
+  identity.flashStatus = 0x00000000;
+  EXPECT_TRUE(identity.IsProgramValid());
+  EXPECT_EQ(Describe(identity).find("NOT VALID"), std::string::npos);
+
+  identity.flashStatus = 0x00000001;   // download in progress
+  EXPECT_FALSE(identity.IsProgramValid());
+  identity.flashStatus = 0x000000A2;   // 81 << 1: no valid program available
+  EXPECT_FALSE(identity.IsProgramValid());
+  EXPECT_NE(Describe(identity).find("NOT VALID"), std::string::npos);
+
+  identity.flashStatus = 0x12340000;   // manufacturer bits only: still valid
+  EXPECT_TRUE(identity.IsProgramValid());
+}

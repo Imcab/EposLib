@@ -32,6 +32,14 @@ struct DeviceIdentity
   std::uint32_t revisionNumber{0};  // 0x1018:03
   std::uint32_t serialNumber{0};    // 0x1018:04, last 8 digits
 
+  // Beyond 0x1018. Read with it, but best effort: an object a firmware does
+  // not have leaves its field at zero instead of failing the whole read.
+  std::uint32_t deviceType{0};           // 0x1000
+  std::string deviceName;                // 0x1008, "EPOS4"
+  std::uint64_t serialNumberComplete{0};  // 0x2100:01, all 64 bits
+  std::uint32_t programSoftware{0};      // 0x1F56:01, Table 6-92
+  std::uint32_t flashStatus{0};          // 0x1F57:01, Table 6-93
+
   // Product code: hardware version in the high word, application number in
   // the low word.
   std::uint16_t HardwareVersion() const {return static_cast<std::uint16_t>(productCode >> 16);}
@@ -43,6 +51,23 @@ struct DeviceIdentity
   std::uint16_t ApplicationVersion() const {return static_cast<std::uint16_t>(revisionNumber);}
 
   bool IsMaxon() const {return vendorId == kMaxonVendorId;}
+
+  // Device type (6.2.1): the profile in the low word - 402 for CiA 402 -
+  // and the drive type in the high word, 2 for a servo drive.
+  std::uint16_t DeviceProfile() const {return static_cast<std::uint16_t>(deviceType);}
+  std::uint16_t DriveType() const {return static_cast<std::uint16_t>(deviceType >> 16);}
+
+  // Program software identification (Table 6-92).
+  std::uint16_t ApplicationProgram() const
+  {
+    return static_cast<std::uint16_t>(programSoftware >> 16);
+  }
+  std::uint16_t BootloaderProgram() const {return static_cast<std::uint16_t>(programSoftware);}
+
+  // Flash status (Table 6-93): bit 0 is "download in progress", bits 7..1
+  // an error code, 0 meaning "valid program available". Anything else and
+  // the firmware on the drive is not to be trusted.
+  bool IsProgramValid() const {return (flashStatus & 0xFFu) == 0;}
 };
 
 // The hardware named by Table 6-66, e.g. 0x6552 -> "EPOS4 Module/Compact

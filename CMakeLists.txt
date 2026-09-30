@@ -164,6 +164,7 @@ if(BUILD_TESTING)
   eposlib_add_test(test_identity eposlib_core)
   eposlib_add_test(test_cyclic_state eposlib_core)
   eposlib_add_test(test_touch_probe eposlib_core)
+  eposlib_add_test(test_capabilities eposlib_core)
   # These two link the device library but open no socket: they exercise
   # what a device allows before CanBus::Start().
   eposlib_add_test(test_encoder_configs eposlib)

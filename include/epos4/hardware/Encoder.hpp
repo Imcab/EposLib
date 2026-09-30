@@ -101,6 +101,15 @@ public:
   // disagree about how far one turn is.
   signals::StatusSignal<std::uint32_t> & GetMainSensorResolution();
 
+  // Every sensor on its own (0x60E4 / 0x60E5, sections 6.2.144-145), not
+  // just the main one GetPosition() follows. The way to compare a motor
+  // encoder with a second one on the output shaft, for instance. Zero for a
+  // slot with no sensor configured. The averaged velocity is low-passed at
+  // 5 Hz.
+  signals::StatusSignal<std::int32_t> & GetSensorPosition(configs::SensorSlot slot);
+  signals::StatusSignal<std::int32_t> & GetSensorVelocity(configs::SensorSlot slot);
+  signals::StatusSignal<std::int32_t> & GetSensorVelocityAveraged(configs::SensorSlot slot);
+
   // -------------------------------------------------------------------------
   // Feedback in real units
   //
@@ -173,6 +182,9 @@ private:
   signals::StatusSignal<std::uint16_t> hallPattern_;
   signals::StatusSignal<std::uint32_t> ssiRawPosition_;
   signals::StatusSignal<std::uint32_t> mainSensorResolution_;
+  signals::StatusSignal<std::int32_t> sensorPosition_[3];
+  signals::StatusSignal<std::int32_t> sensorVelocity_[3];
+  signals::StatusSignal<std::int32_t> sensorVelocityAveraged_[3];
 
   MechanismScale converter_;
 };

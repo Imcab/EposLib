@@ -163,6 +163,23 @@ public:
     (*this)[0x1018][1] = std::uint32_t{0x000000FB};  // VendorNumber, maxon
     (*this)[0x1018][2] = std::uint32_t{0x65520000};  // ProductNumber
     (*this)[0x1018][3] = std::uint32_t{0x01700000};  // RevisionNumber
+    (*this)[0x1018][4] = std::uint32_t{12345678};    // Serial number, last 8 digits
+
+    // Read-only values the drive fills in itself, which is why the EDS
+    // leaves them empty. Taken from the defaults the firmware specification
+    // gives, so reading them exercises the same decoding as on hardware.
+    (*this)[0x1000][0] = std::uint32_t{0x00020192};   // CiA 402 servo drive (6.2.1)
+    Set(0x1008, 0, "EPOS4");                          // 6.2.5, VISIBLE_STRING
+    (*this)[0x1F56][1] = std::uint32_t{0x01700000};   // program software identification
+    (*this)[0x1F57][1] = std::uint32_t{0};            // valid program available
+    (*this)[0x2010][0] = std::uint8_t{1};             // CANopen (Table 6-96)
+    (*this)[0x200A][0] = std::uint8_t{0};             // 1 Mbit/s (Table 6-94)
+    (*this)[0x2100][1] = std::uint64_t{0x0000000012345678};
+    (*this)[0x6502][0] = std::uint32_t{0x000003A5};   // PPM PVM HMM CSP CSV CST
+    const std::int8_t methods[] = {37, 34, 33, 27, 23, 18, 17, 11, 7, 2, 1, -1, -2, -3, -4};
+    for (std::uint8_t i = 0; i < 15; ++i) {
+      (*this)[0x60E3][static_cast<std::uint8_t>(i + 1)] = methods[i];
+    }
   }
 
   // Plausible readings for the objects the EDS leaves at zero, so that
@@ -175,6 +192,9 @@ public:
   {
     (*this)[0x2200][1] = std::uint16_t{480};
     (*this)[0x3201][1] = std::int16_t{350};
+    (*this)[0x3160][1] = std::int16_t{1234};   // analog input 1: 1.234 V
+    (*this)[0x3160][2] = std::int16_t{-500};   // analog input 2: -0.5 V
+    PublishAnalog();
     SetCurrent(false);
   }
 
@@ -686,6 +706,43 @@ private:
       positive ? "positive" : "negative", position, count);
   }
 
+  // The per-sensor and averaged copies of the feedback (0x60E4, 0x60E5,
+  // 0x30D2, 0x30D3). Sensor 1 is the main sensor here, so it carries the
+  // same values; the averaged ones are not filtered - this is not a model
+  // of the drive's low-pass, only of where the values appear.
+  void
+  MirrorFeedback()
+  {
+    const std::int32_t position = (*this)[0x6064][0];
+    const std::int32_t velocity = (*this)[0x606C][0];
+    const std::int16_t torque = (*this)[0x6077][0];
+    (*this)[0x60E4][1] = position;
+    (*this)[0x60E5][1] = velocity;
+    (*this)[0x60E5][9] = velocity;
+    (*this)[0x30D3][1] = velocity;
+    (*this)[0x30D2][1] = torque;
+  }
+
+  // Analog I/O (6.2.79-87): each input feeds the general purpose value its
+  // 0x3161 function names; each output shows the general purpose value its
+  // 0x3181 function names.
+  void
+  PublishAnalog()
+  {
+    for (std::uint8_t ch = 1; ch <= 2; ++ch) {
+      const std::uint8_t in = (*this)[0x3161][ch];
+      if (in <= 1) {
+        const std::int16_t mv = (*this)[0x3160][ch];
+        (*this)[0x3162][static_cast<std::uint8_t>(in + 1)] = mv;
+      }
+      const std::uint8_t out = (*this)[0x3181][ch];
+      if (out <= 1) {
+        const std::int32_t mv = (*this)[0x3182][static_cast<std::uint8_t>(out + 1)];
+        (*this)[0x3180][ch] = static_cast<std::int16_t>(mv);
+      }
+    }
+  }
+
   // 0x3150:01, the pins: each output pin (0x3151:01..03) shows the state of
   // the function assigned to it in 0x60FE:01, inverted where its bit in
   // «Digital outputs polarity» (0x3150:02) is set - sections 6.2.76-77.
@@ -738,6 +795,7 @@ private:
       (*this)[0x6064][0] = position_;
       (*this)[0x606C][0] = static_cast<std::int32_t>(
         (position_ - before) * 60.0 * 1000.0 / kTickMs / CountsPerRevolution());
+      MirrorFeedback();
       PublishStatusword();
       if (moving_) {ArmMotion();}
       return;
@@ -761,6 +819,7 @@ private:
       (*this)[0x6064][0] = position_;
       (*this)[0x606C][0] = static_cast<std::int32_t>(velocityRpm_);
       (*this)[0x6077][0] = torqueActual_;
+      MirrorFeedback();
       SetCurrent(velocityRpm_ != 0.0 || torqueActual_ != 0);
       ArmMotion();
       return;
@@ -792,6 +851,7 @@ private:
     // in the position modes.
     (*this)[0x606C][0] = static_cast<std::int32_t>(
       (position_ - before) * 60.0 * 1000.0 / kTickMs / CountsPerRevolution());
+    MirrorFeedback();
     SetCurrent(moving_);
     PublishStatusword();
     if (moving_) {ArmMotion();}
@@ -871,6 +931,7 @@ private:
       torqueActual_ = 0;
       (*this)[0x606C][0] = std::int32_t{0};
       (*this)[0x6077][0] = std::int16_t{0};
+      MirrorFeedback();
     }
     PublishStatusword();
   }
@@ -993,6 +1054,8 @@ private:
             HandleCyclicTarget(static_cast<sig::OperationMode>(mode));
           });
       }
+    } else if (idx == 0x3161 || idx == 0x3181 || idx == 0x3182) {
+      PublishAnalog();
     } else if (idx == 0x60B8 && subidx == 0) {
       ConfigureTouchProbe();
     } else if (idx == 0x60FE || idx == 0x3151 || (idx == 0x3150 && subidx == 2)) {
