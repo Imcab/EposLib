@@ -278,3 +278,34 @@ TEST(PowerUnits, CurrentIsMilliamps)
   EXPECT_DOUBLE_EQ(ToCurrent(1500).value(), 1.5);
   EXPECT_DOUBLE_EQ(ToCurrent(-250).value(), -0.25);
 }
+
+
+// --- torque setpoints --------------------------------------------------------
+
+// A torque becomes thousandths of the MOTOR's rated torque. 0.1 N m against
+// a rated 0.2 N m (200000 uNm) is half: 500.
+TEST(TorqueSetpoint, ATorqueResolvesAgainstRatedTorque)
+{
+  std::int16_t out{};
+  ASSERT_TRUE(Resolve(TorqueSetpoint{units::torque::newton_meter_t{0.1}}, 200000u, out));
+  EXPECT_EQ(out, 500);
+
+  ASSERT_TRUE(Resolve(TorqueSetpoint{units::torque::newton_meter_t{-0.05}}, 200000u, out));
+  EXPECT_EQ(out, -250);
+}
+
+TEST(TorqueSetpoint, RawPassesThroughWithoutRatedTorque)
+{
+  std::int16_t out{};
+  ASSERT_TRUE(Resolve(TorqueSetpoint{250}, 0u, out));
+  EXPECT_EQ(out, 250);
+}
+
+// Rated torque zero means the motor data was never set: refuse rather than
+// command a number scaled by an unknown.
+TEST(TorqueSetpoint, ATorqueWithoutRatedTorqueIsRefused)
+{
+  std::int16_t out{123};
+  EXPECT_FALSE(Resolve(TorqueSetpoint{units::torque::newton_meter_t{0.1}}, 0u, out));
+  EXPECT_EQ(out, 123);  // untouched
+}

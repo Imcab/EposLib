@@ -189,7 +189,19 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
     }
     try {
       tpdo_mapped[od::cia402::kControlword][0] = cyclic.Controlword();
-      tpdo_mapped[od::cia402::kTargetPosition][0] = cyclic.StagedTargetPosition();
+      // Only the active mode's target. The others keep whatever they last
+      // held in the RPDO, which the drive ignores outside their mode.
+      switch (cyclic.Mode()) {
+        case core::CyclicMode::kPosition:
+          tpdo_mapped[od::cia402::kTargetPosition][0] = cyclic.StagedTargetPosition();
+          break;
+        case core::CyclicMode::kVelocity:
+          tpdo_mapped[od::cia402::kTargetVelocity][0] = cyclic.StagedTargetVelocity();
+          break;
+        case core::CyclicMode::kTorque:
+          tpdo_mapped[od::cia402::kTargetTorque][0] = cyclic.StagedTargetTorque();
+          break;
+      }
     } catch (...) {
       // Not mapped: nothing to publish. The cyclic path is only meaningful
       // with a PDO mapping, and its absence shows up as IsCyclicHealthy()
@@ -302,6 +314,10 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // one: the last feedback received, the staged setpoint, and the rule for
   // trusting them. Lock-free throughout; see core::CyclicState.
   core::CyclicState cyclic;
+
+  // «Motor rated torque», read when torque mode is entered, so a torque in
+  // N m can be staged from the control loop without an SDO read there.
+  std::atomic<std::uint32_t> cyclicRatedTorque{0};
 
 
   // Makes sure the drive is in the mode a control request needs. Writing
@@ -1070,25 +1086,58 @@ Epos4::SetControl(const controls::ProfileVelocity & request)
   return d.WriteOutput<std::int32_t>(od::At(od::cia402::kTargetVelocity), targetRpm);
 }
 
+namespace
+{
+
+// A torque given as a torque needs the motor's rated torque to become the
+// drive's unit (thousandths of 0x6076); a raw one does not, and then the
+// rated torque is not read at all. Reads it once and keeps it in the signal.
+std::error_code
+ResolveTorque(
+  signals::StatusSignal<std::uint32_t> & ratedTorque, const TorqueSetpoint & setpoint,
+  std::int16_t & out)
+{
+  if (!setpoint.IsRaw() && !ratedTorque.HasValue()) {
+    if (auto ec = ratedTorque.Refresh().GetStatus()) {return ec;}
+  }
+  return Resolve(setpoint, ratedTorque.GetValue(), out) ?
+         std::error_code{} : std::make_error_code(std::errc::invalid_argument);
+}
+
+}  // namespace
+
 std::error_code
 Epos4::SetControl(const controls::CyclicPosition & request)
 {
   auto & d = *impl_;
 
-  if (auto ec = d.EnsureMode(controls::CyclicPosition::kMode)) {return ec;}
-
+  // Everything resolved before anything is written: a request that cannot
+  // be expressed in drive units must not leave half of itself behind.
   std::int32_t targetCounts{};
   if (!Resolve(request.position, GetMechanism(), targetCounts)) {
     return std::make_error_code(std::errc::invalid_argument);
   }
+  std::int32_t positionOffset{};
+  if (request.positionOffset &&
+    !Resolve(*request.positionOffset, GetMechanism(), positionOffset))
+  {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  std::int16_t torqueOffset{};
+  if (request.torqueOffset) {
+    if (auto ec = ResolveTorque(d.motorRatedTorque, *request.torqueOffset, torqueOffset)) {
+      return ec;
+    }
+  }
 
+  if (auto ec = d.EnsureMode(controls::CyclicPosition::kMode)) {return ec;}
   if (request.positionOffset) {
     if (auto ec = d.Write<std::int32_t>(
-        od::At(od::cia402::kPositionOffset), *request.positionOffset)) {return ec;}
+        od::At(od::cia402::kPositionOffset), positionOffset)) {return ec;}
   }
   if (request.torqueOffset) {
     if (auto ec = d.Write<std::int16_t>(
-        od::At(od::cia402::kTorqueOffset), *request.torqueOffset)) {return ec;}
+        od::At(od::cia402::kTorqueOffset), torqueOffset)) {return ec;}
   }
   // The cyclic modes exist to be commanded every cycle. Staging the setpoint
   // in the RPDO lets it ride the next SYNC instead of costing an SDO round
@@ -1101,24 +1150,32 @@ Epos4::SetControl(const controls::CyclicVelocity & request)
 {
   auto & d = *impl_;
 
-  if (auto ec = d.EnsureMode(controls::CyclicVelocity::kMode)) {return ec;}
-
   std::int32_t targetRpm{};
   if (!Resolve(request.velocity, GetMechanism(), targetRpm)) {
     return std::make_error_code(std::errc::invalid_argument);
   }
+  std::int32_t velocityOffset{};
+  if (request.velocityOffset &&
+    !Resolve(*request.velocityOffset, GetMechanism(), velocityOffset))
+  {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  std::int16_t torqueOffset{};
+  if (request.torqueOffset) {
+    if (auto ec = ResolveTorque(d.motorRatedTorque, *request.torqueOffset, torqueOffset)) {
+      return ec;
+    }
+  }
 
+  if (auto ec = d.EnsureMode(controls::CyclicVelocity::kMode)) {return ec;}
   if (request.velocityOffset) {
     if (auto ec = d.Write<std::int32_t>(
-        od::At(od::cia402::kVelocityOffset), *request.velocityOffset)) {return ec;}
+        od::At(od::cia402::kVelocityOffset), velocityOffset)) {return ec;}
   }
   if (request.torqueOffset) {
     if (auto ec = d.Write<std::int16_t>(
-        od::At(od::cia402::kTorqueOffset), *request.torqueOffset)) {return ec;}
+        od::At(od::cia402::kTorqueOffset), torqueOffset)) {return ec;}
   }
-  // The cyclic modes exist to be commanded every cycle. Staging the setpoint
-  // in the RPDO lets it ride the next SYNC instead of costing an SDO round
-  // trip per update.
   return d.WriteOutput<std::int32_t>(od::At(od::cia402::kTargetVelocity), targetRpm);
 }
 
@@ -1127,16 +1184,21 @@ Epos4::SetControl(const controls::CyclicTorque & request)
 {
   auto & d = *impl_;
 
-  if (auto ec = d.EnsureMode(controls::CyclicTorque::kMode)) {return ec;}
+  std::int16_t target{};
+  if (auto ec = ResolveTorque(d.motorRatedTorque, request.torque, target)) {return ec;}
+  std::int16_t torqueOffset{};
+  if (request.torqueOffset) {
+    if (auto ec = ResolveTorque(d.motorRatedTorque, *request.torqueOffset, torqueOffset)) {
+      return ec;
+    }
+  }
 
+  if (auto ec = d.EnsureMode(controls::CyclicTorque::kMode)) {return ec;}
   if (request.torqueOffset) {
     if (auto ec = d.Write<std::int16_t>(
-        od::At(od::cia402::kTorqueOffset), *request.torqueOffset)) {return ec;}
+        od::At(od::cia402::kTorqueOffset), torqueOffset)) {return ec;}
   }
-  // The cyclic modes exist to be commanded every cycle. Staging the setpoint
-  // in the RPDO lets it ride the next SYNC instead of costing an SDO round
-  // trip per update.
-  return d.WriteOutput<std::int16_t>(od::At(od::cia402::kTargetTorque), request.torque);
+  return d.WriteOutput<std::int16_t>(od::At(od::cia402::kTargetTorque), target);
 }
 
 std::error_code
@@ -1530,31 +1592,69 @@ namespace epos4
 // Cyclic path
 // ---------------------------------------------------------------------------
 
-std::error_code
-Epos4::EnterCyclicPositionMode()
+namespace
 {
-  if (!impl_) {
-    return std::make_error_code(std::errc::not_connected);
-  }
-  auto & d = *impl_;
 
+// Shared by the three Enter*Mode() calls: they differ only in the operating
+// mode and in which setpoint OnSync publishes.
+std::error_code
+EnterCyclic(Epos4::Impl & d, signals::OperationMode mode, core::CyclicMode cyclicMode)
+{
   // The one SDO exchange of the whole cyclic path. Doing it here instead of
   // per command is the difference between a control loop and a bus flood.
-  if (auto ec = d.EnsureMode(signals::OperationMode::kCyclicSynchronousPosition)) {
+  if (auto ec = d.EnsureMode(mode)) {
     return ec;
   }
 
-  // Seed the setpoint with where the axis actually is. Publishing a zero on
-  // the first SYNC would command a move to the origin, which on an arm is a
-  // swing across its whole range.
+  // Seed every setpoint with where the axis actually is - see
+  // CyclicState::Activate(). Read by SDO: the cached PDO value may be a
+  // cycle old, and this is the value the first SYNC will command.
   std::int32_t position{};
   if (auto ec = d.Read<std::int32_t>(od::At(od::cia402::kPositionActualValue), position)) {
     return ec;
   }
+  std::int16_t torque{};
+  if (cyclicMode == core::CyclicMode::kTorque) {
+    if (auto ec = d.Read<std::int16_t>(od::At(od::cia402::kTorqueActualValue), torque)) {
+      return ec;
+    }
+    std::uint32_t rated{};
+    if (auto ec = d.Read<std::uint32_t>(od::At(od::cia402::kMotorRatedTorque), rated)) {
+      return ec;
+    }
+    d.cyclicRatedTorque.store(rated, std::memory_order_relaxed);
+  }
+
   // The Controlword published on every SYNC is whatever the state machine
   // last built, so an axis that was enabled stays enabled.
-  d.cyclic.Activate(position, d.controlword.Raw());
+  d.cyclic.Activate(cyclicMode, position, torque, d.controlword.Raw());
   return {};
+}
+
+}  // namespace
+
+std::error_code
+Epos4::EnterCyclicPositionMode()
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  return EnterCyclic(
+    *impl_, signals::OperationMode::kCyclicSynchronousPosition, core::CyclicMode::kPosition);
+}
+
+std::error_code
+Epos4::EnterCyclicVelocityMode()
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  return EnterCyclic(
+    *impl_, signals::OperationMode::kCyclicSynchronousVelocity, core::CyclicMode::kVelocity);
+}
+
+std::error_code
+Epos4::EnterCyclicTorqueMode()
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  return EnterCyclic(
+    *impl_, signals::OperationMode::kCyclicSynchronousTorque, core::CyclicMode::kTorque);
 }
 
 void
@@ -1601,12 +1701,35 @@ Epos4::GetCachedErrorCode() const
   return impl_ ? impl_->lastEmcyCode.load(std::memory_order_relaxed) : 0;
 }
 
-void
-Epos4::StageTargetPosition(std::int32_t quadCounts)
+bool
+Epos4::StageTargetPosition(PositionSetpoint position)
 {
-  if (impl_) {
-    impl_->cyclic.StageTargetPosition(quadCounts);
+  std::int32_t counts{};
+  if (!impl_ || !Resolve(position, GetMechanism(), counts)) {return false;}
+  impl_->cyclic.StageTargetPosition(counts);
+  return true;
+}
+
+bool
+Epos4::StageTargetVelocity(VelocitySetpoint velocity)
+{
+  std::int32_t rpm{};
+  if (!impl_ || !Resolve(velocity, GetMechanism(), rpm)) {return false;}
+  impl_->cyclic.StageTargetVelocity(rpm);
+  return true;
+}
+
+bool
+Epos4::StageTargetTorque(TorqueSetpoint torque)
+{
+  std::int16_t perThousand{};
+  if (!impl_ ||
+    !Resolve(torque, impl_->cyclicRatedTorque.load(std::memory_order_relaxed), perThousand))
+  {
+    return false;
   }
+  impl_->cyclic.StageTargetTorque(perThousand);
+  return true;
 }
 
 bool

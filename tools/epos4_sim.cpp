@@ -283,10 +283,23 @@ private:
   // The drive does not generate a trajectory here: the master sends a new
   // target every SYNC and the drive interpolates towards it over the
   // interpolation time period (0x60C2). Modelled the same way.
-  bool cspFollowing_{false};
+  bool cyclicFollowing_{false};
+
+  // --- Cyclic Synchronous Velocity and Torque ---
+  //
+  // Not a motor model: enough that a commanded velocity turns into motion
+  // and a commanded torque into acceleration, so the cyclic path can be
+  // verified end to end. Velocity follows its command through a first-order
+  // lag; under torque, velocity grows with the torque against a damping
+  // term, so a constant torque settles at a constant speed.
+  std::int32_t commandedRpm_{0};
+  std::int16_t commandedTorque_{0};  // thousandths of rated torque
+  double velocityRpm_{0.0};
+  std::int16_t torqueActual_{0};
 
   // --- Profile Position Mode ---
   std::int32_t position_{0};
+  double positionExact_{0.0};  // integrates fractions of a count at low speed
   std::int32_t target_{0};
   std::uint32_t profileVelocity_{1000};
   std::int32_t interpolationMs_{10};
@@ -352,11 +365,11 @@ private:
   HandleCsp()
   {
     const std::int32_t target = (*this)[0x607A][0];
-    if (target == target_ && cspFollowing_) {
+    if (target == target_ && cyclicFollowing_) {
       return;
     }
     target_ = target;
-    cspFollowing_ = true;
+    cyclicFollowing_ = true;
     moving_ = true;
     targetReached_ = false;
 
@@ -371,6 +384,47 @@ private:
     ArmMotion();
   }
 
+  // CSV and CST: latch the new command (target plus the optional feed
+  // forward offset, 0x60B1 / 0x60B2, as sections 3.7 and 3.8 add them) and
+  // keep the motion timer running for as long as the mode is followed.
+  void
+  HandleCsv()
+  {
+    const std::int32_t target = (*this)[0x60FF][0];
+    const std::int32_t offset = (*this)[0x60B1][0];
+    commandedRpm_ = target + offset;
+    StartFollowing();
+  }
+
+  void
+  HandleCst()
+  {
+    const std::int16_t target = (*this)[0x6071][0];
+    const std::int16_t offset = (*this)[0x60B2][0];
+    commandedTorque_ = static_cast<std::int16_t>(target + offset);
+    StartFollowing();
+  }
+
+  void
+  StartFollowing()
+  {
+    const bool wasFollowing = cyclicFollowing_;
+    cyclicFollowing_ = true;
+    moving_ = true;
+    if (!wasFollowing) {PublishStatusword();}
+    ArmMotion();
+  }
+
+  // Counts per motor revolution, to turn counts per tick into rpm. «Main
+  // sensor resolution» (0x3000:05) once an encoder is configured; until then
+  // 2000, a 500 CPR encoder - the example the demos use.
+  double
+  CountsPerRevolution()
+  {
+    const std::uint32_t resolution = (*this)[0x3000][5];
+    return resolution == 0 ? 2000.0 : static_cast<double>(resolution);
+  }
+
   // A crude but honest trapezoid-free ramp: step towards the target at the
   // profile velocity. Enough to exercise Target reached and the handshake;
   // not a claim to model the drive's real trajectory generator.
@@ -380,12 +434,35 @@ private:
     if (!moving_) {return;}
 
     constexpr std::int32_t kTickMs = 20;
+    const std::int32_t before = position_;
+
+    const auto mode = static_cast<sig::OperationMode>(std::int8_t{(*this)[0x6061][0]});
+    if (mode == sig::OperationMode::kCyclicSynchronousVelocity ||
+      mode == sig::OperationMode::kCyclicSynchronousTorque)
+    {
+      constexpr double dt = kTickMs / 1000.0;
+      if (mode == sig::OperationMode::kCyclicSynchronousVelocity) {
+        velocityRpm_ += (commandedRpm_ - velocityRpm_) * 0.4;   // first-order lag
+        torqueActual_ = static_cast<std::int16_t>((commandedRpm_ - velocityRpm_) * 0.5);
+      } else {
+        torqueActual_ = commandedTorque_;
+        velocityRpm_ += (torqueActual_ * 2.0 - velocityRpm_) * 0.2;  // torque vs damping
+      }
+      positionExact_ += velocityRpm_ / 60.0 * CountsPerRevolution() * dt;
+      position_ = static_cast<std::int32_t>(positionExact_);
+      (*this)[0x6064][0] = position_;
+      (*this)[0x606C][0] = static_cast<std::int32_t>(velocityRpm_);
+      (*this)[0x6077][0] = torqueActual_;
+      SetCurrent(velocityRpm_ != 0.0 || torqueActual_ != 0);
+      ArmMotion();
+      return;
+    }
 
     // Under CSP the move is bounded by the interpolation period, not by a
     // profile velocity: the drive has to arrive by the time the next setpoint
     // is due.
     const std::int32_t stepSize =
-      cspFollowing_ ?
+      cyclicFollowing_ ?
       ((target_ - position_) * kTickMs) /
       (interpolationMs_ > kTickMs ? interpolationMs_ : kTickMs) :
       static_cast<std::int32_t>(profileVelocity_) * kTickMs / 1000;
@@ -401,6 +478,11 @@ private:
     }
 
     (*this)[0x6064][0] = position_;
+    positionExact_ = position_;
+    // Velocity actual from how far this tick moved; torque is not modelled
+    // in the position modes.
+    (*this)[0x606C][0] = static_cast<std::int32_t>(
+      (position_ - before) * 60.0 * 1000.0 / kTickMs / CountsPerRevolution());
     SetCurrent(moving_);
     PublishStatusword();
     if (moving_) {ArmMotion();}
@@ -452,7 +534,7 @@ private:
     if (targetReached_) {sw |= sig::status_bits::kTargetReached;}
     // Bit 12 under CSP is «Drive follows command value», not «Setpoint
     // acknowledge». Same bit, different meaning, decided by 0x6061.
-    if (cspFollowing_) {sw |= sig::status_bits::kFollowsCommandValue;}
+    if (cyclicFollowing_) {sw |= sig::status_bits::kFollowsCommandValue;}
     (*this)[0x6041][0] = sw;
   }
 
@@ -461,10 +543,17 @@ private:
   {
     state_ = s;
     if (s != sig::State::kOperationEnabled) {
-      // Losing power aborts whatever move was running.
+      // Losing power aborts whatever move was running, and a motor without
+      // power neither turns nor produces torque.
       moving_ = false;
       setpointAcknowledged_ = false;
-      cspFollowing_ = false;
+      cyclicFollowing_ = false;
+      commandedRpm_ = 0;
+      commandedTorque_ = 0;
+      velocityRpm_ = 0.0;
+      torqueActual_ = 0;
+      (*this)[0x606C][0] = std::int32_t{0};
+      (*this)[0x6077][0] = std::int16_t{0};
     }
     PublishStatusword();
   }
@@ -514,11 +603,23 @@ private:
         state_ == sig::State::kOperationEnabled)
       {
         HandlePpm(cw);
-      } else if (activeMode == sig::OperationMode::kCyclicSynchronousPosition &&
-        state_ == sig::State::kOperationEnabled)
-      {
-        HandleCsp();
+      } else if (state_ == sig::State::kOperationEnabled) {
+        HandleCyclicTarget(activeMode);
       }
+    }
+  }
+
+  // The cyclic modes have no handshake: the drive follows whatever target
+  // the RPDO last carried. Called on a Controlword (entering the mode) and
+  // on every write of a target or offset.
+  void
+  HandleCyclicTarget(sig::OperationMode mode)
+  {
+    switch (mode) {
+      case sig::OperationMode::kCyclicSynchronousPosition: HandleCsp(); break;
+      case sig::OperationMode::kCyclicSynchronousVelocity: HandleCsv(); break;
+      case sig::OperationMode::kCyclicSynchronousTorque: HandleCst(); break;
+      default: break;
     }
   }
 
@@ -535,16 +636,21 @@ private:
       // the very same frame. A real drive applies the whole PDO before acting
       // on it; posting to the executor runs this once the frame is complete.
       GetExecutor().post([this]() {HandleControlword();});
-    } else if (idx == 0x607A && subidx == 0) {
-      // A new target arriving by RPDO is what drives CSP. In PPM the same
-      // object is latched by the setpoint handshake instead, so the mode
-      // decides which of the two applies.
-      const std::int8_t mode = (*this)[0x6061][0];
-      if (static_cast<sig::OperationMode>(mode) ==
-        sig::OperationMode::kCyclicSynchronousPosition &&
-        state_ == sig::State::kOperationEnabled)
-      {
-        HandleCsp();
+    } else if (
+      (idx == 0x607A || idx == 0x60FF || idx == 0x6071 || idx == 0x60B1 || idx == 0x60B2) &&
+      subidx == 0)
+    {
+      // A new target or offset arriving by RPDO is what drives the cyclic
+      // modes. In PPM, Target position is latched by the setpoint handshake
+      // instead; HandleCyclicTarget ignores every mode but CSP/CSV/CST.
+      // Deferred for the same reason as the Controlword: act on the whole
+      // PDO, not on the first object of it.
+      if (state_ == sig::State::kOperationEnabled) {
+        GetExecutor().post(
+          [this]() {
+            const std::int8_t mode = (*this)[0x6061][0];
+            HandleCyclicTarget(static_cast<sig::OperationMode>(mode));
+          });
       }
     } else if (idx == 0x6060 && subidx == 0) {
       // Modes of operation: echo the request into Modes of operation display,

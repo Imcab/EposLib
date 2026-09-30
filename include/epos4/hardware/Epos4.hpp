@@ -390,6 +390,19 @@ public:
   // The drive must already be enabled: this does not walk the state machine.
   std::error_code EnterCyclicPositionMode();
 
+  // The same for Cyclic Synchronous Velocity (section 3.7) and Torque (3.8).
+  // Only the setpoint that goes out on every SYNC differs: Target velocity
+  // (0x60FF) or Target torque (0x6071) instead of Target position. Both must
+  // be mapped into an RPDO in bus.yml, as epos4_network maps them.
+  //
+  // Each seeds its setpoint so the first SYNC holds the axis: velocity mode
+  // starts at zero, and torque mode at the torque the axis is producing now -
+  // zero there would let go of the load. Torque mode also reads «Motor rated
+  // torque» here, once, so StageTargetTorque() can take a torque in N m
+  // without an SDO read inside the loop.
+  std::error_code EnterCyclicVelocityMode();
+  std::error_code EnterCyclicTorqueMode();
+
   // Stops publishing. The drive keeps whatever mode it is in; use Disable()
   // to remove power.
   void ExitCyclicMode();
@@ -413,9 +426,28 @@ public:
   // would read as the cause of whatever just happened.
   std::chrono::steady_clock::duration GetTimeSinceLastEmergency() const;
 
-  // Stages the next target position. It goes out on the following SYNC.
-  // Lock-free, and safe to call from a different thread than the bus.
-  void StageTargetPosition(std::int32_t quadCounts);
+  // Stage the next setpoint. It goes out on the following SYNC. Lock-free,
+  // and safe to call from a different thread than the bus.
+  //
+  // Each takes the raw drive unit or a physical quantity, like the control
+  // requests:
+  //
+  //   motor.StageTargetPosition(50000);        // quadcounts
+  //   motor.StageTargetPosition(90_deg);       // at the output, via SetMechanism()
+  //   motor.StageTargetVelocity(1500);         // rpm at the motor
+  //   motor.StageTargetVelocity(15_rpm);       // at the output
+  //   motor.StageTargetTorque(250);            // thousandths of rated torque
+  //   motor.StageTargetTorque(0.5_Nm);         // at the motor shaft
+  //
+  // False, and nothing staged, when a quantity cannot be converted: no
+  // mechanism configured, or for torque, no rated torque (motor data not set,
+  // or not in torque mode). Converting is arithmetic only - no bus access.
+  //
+  // Staging a setpoint the active mode does not publish is harmless and has
+  // no effect until that mode is entered.
+  bool StageTargetPosition(PositionSetpoint position);
+  bool StageTargetVelocity(VelocitySetpoint velocity);
+  bool StageTargetTorque(TorqueSetpoint torque);
 
   // True while PDOs are arriving and the drive reports «Operation enabled».
   //

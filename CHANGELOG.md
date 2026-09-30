@@ -18,6 +18,24 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Added
 
+- **The lock-free cyclic path for velocity and torque**, next to position:
+  `EnterCyclicVelocityMode()` / `EnterCyclicTorqueMode()` and
+  `StageTargetVelocity()` / `StageTargetTorque()`. Each SYNC publishes the
+  active mode's target (0x607A, 0x60FF or 0x6071). Setpoints are seeded to
+  hold the axis: velocity mode starts at zero, torque mode at the torque the
+  axis is producing - zero would drop a load on a vertical joint.
+  All three `StageTarget*()` take raw units or quantities (`90_deg`,
+  `15_rpm`, `0.5_Nm`) and return false rather than guess when a quantity
+  cannot be converted. Torque in N m uses the rated torque read once when
+  entering the mode, so the loop never does an SDO read. Verified on vcan0:
+  1500 rpm gives 50000 counts/s at 2000 counts/rev, and the RPDO carries
+  the targets with no SDO traffic while cycling.
+- `TorqueSetpoint`: the cyclic torque target and every torque offset
+  (0x60B2) take N m as well as thousandths of rated torque; position and
+  velocity offsets (0x60B0, 0x60B1) take quantities too.
+- `epos4_sim` models Cyclic Synchronous Velocity and Torque, and publishes
+  Velocity actual (0x606C) and Torque actual (0x6077) in every mode.
+
 - `test_device_lifecycle`: what a device allows before the bus starts.
 - `core::CyclicState` in `epos4_core`: the state the cyclic path shares
   between the control loop and the CANopen thread, and the rule for trusting
@@ -103,6 +121,9 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Fixed
 
+- The cyclic `SetControl()` overloads switched the drive's mode before
+  validating the request; a request that could not be converted then
+  failed with the mode already changed. Everything is resolved first now.
 - **`CanBus` could hang forever on destruction.** `Stop()` submitted the
   deconfigure-and-shutdown and then called `loop->stop()` at once, racing
   it. When the loop stopped first, `ctx->shutdown()` never ran, socket reads

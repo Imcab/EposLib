@@ -237,3 +237,53 @@ TEST(CyclicState, AReaderThatSeesActiveSeesTheSeededTarget)
     control.join();
   }
 }
+
+
+// ---- velocity and torque ---------------------------------------------------
+
+TEST(CyclicState, EachModeRemembersWhichSetpointItPublishes)
+{
+  CyclicState cyclic;
+  cyclic.Activate(epos4::core::CyclicMode::kVelocity, 0, 0, 0x000F);
+  EXPECT_EQ(cyclic.Mode(), epos4::core::CyclicMode::kVelocity);
+
+  cyclic.Activate(epos4::core::CyclicMode::kTorque, 0, 0, 0x000F);
+  EXPECT_EQ(cyclic.Mode(), epos4::core::CyclicMode::kTorque);
+
+  cyclic.Activate(0, 0x000F);  // the two-argument form is position
+  EXPECT_EQ(cyclic.Mode(), epos4::core::CyclicMode::kPosition);
+}
+
+// Entering velocity mode must stand the axis still, not keep a speed staged
+// by an earlier session.
+TEST(CyclicState, VelocityModeStartsAtZero)
+{
+  CyclicState cyclic;
+  cyclic.StageTargetVelocity(3000);
+  cyclic.Activate(epos4::core::CyclicMode::kVelocity, 1234, 0, 0x000F);
+
+  EXPECT_EQ(cyclic.StagedTargetVelocity(), 0);
+}
+
+// The one that matters on an arm: a vertical joint under gravity holds
+// only while it is producing torque. Seeding zero would drop the load on
+// the first SYNC.
+TEST(CyclicState, TorqueModeStartsAtTheTorqueTheAxisIsProducing)
+{
+  CyclicState cyclic;
+  cyclic.Activate(epos4::core::CyclicMode::kTorque, 5000, -312, 0x000F);
+
+  EXPECT_EQ(cyclic.StagedTargetTorque(), -312);
+  EXPECT_EQ(cyclic.StagedTargetPosition(), 5000);
+}
+
+TEST(CyclicState, StagingVelocityAndTorqueReplacesThem)
+{
+  CyclicState cyclic;
+  cyclic.Activate(epos4::core::CyclicMode::kVelocity, 0, 0, 0x000F);
+  cyclic.StageTargetVelocity(-1500);
+  cyclic.StageTargetTorque(400);
+
+  EXPECT_EQ(cyclic.StagedTargetVelocity(), -1500);
+  EXPECT_EQ(cyclic.StagedTargetTorque(), 400);
+}
