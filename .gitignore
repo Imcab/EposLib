@@ -64,9 +64,13 @@ compile_commands.json
 *.a
 *.so
 *.so.*
-core
-core.*
-vgcore.*
+# Core dumps, which land where the process ran. Anchored to the root: an
+# unanchored `core` also matches every DIRECTORY named core, and this
+# library has two (include/epos4/core, src/core). It silently kept them out
+# of a commit once, after they were moved.
+/core
+/core.*
+/vgcore.*
 *.gcda
 *.gcno
 *.gcov

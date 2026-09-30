@@ -93,14 +93,14 @@ struct CyclicPosition
 {
   PositionSetpoint position{0};  // 0x607A
 
-  std::optional<std::int32_t> positionOffset;  // 0x60B0, [quadcounts]
-  std::optional<std::int16_t> torqueOffset;    // 0x60B2, feed forward
+  std::optional<PositionSetpoint> positionOffset;  // 0x60B0, added to the target
+  std::optional<TorqueSetpoint> torqueOffset;      // 0x60B2, feed forward
 
   static constexpr auto kMode = signals::OperationMode::kCyclicSynchronousPosition;
 
   CyclicPosition & WithPosition(PositionSetpoint v) {position = v; return *this;}
-  CyclicPosition & WithPositionOffset(std::int32_t v) {positionOffset = v; return *this;}
-  CyclicPosition & WithTorqueOffset(std::int16_t v) {torqueOffset = v; return *this;}
+  CyclicPosition & WithPositionOffset(PositionSetpoint v) {positionOffset = v; return *this;}
+  CyclicPosition & WithTorqueOffset(TorqueSetpoint v) {torqueOffset = v; return *this;}
 };
 
 
@@ -109,28 +109,31 @@ struct CyclicVelocity
 {
   VelocitySetpoint velocity{0};  // 0x60FF
 
-  std::optional<std::int32_t> velocityOffset;  // 0x60B1
-  std::optional<std::int16_t> torqueOffset;    // 0x60B2
+  std::optional<VelocitySetpoint> velocityOffset;  // 0x60B1, feed forward
+  std::optional<TorqueSetpoint> torqueOffset;      // 0x60B2, feed forward
 
   static constexpr auto kMode = signals::OperationMode::kCyclicSynchronousVelocity;
 
   CyclicVelocity & WithVelocity(VelocitySetpoint v) {velocity = v; return *this;}
-  CyclicVelocity & WithVelocityOffset(std::int32_t v) {velocityOffset = v; return *this;}
-  CyclicVelocity & WithTorqueOffset(std::int16_t v) {torqueOffset = v; return *this;}
+  CyclicVelocity & WithVelocityOffset(VelocitySetpoint v) {velocityOffset = v; return *this;}
+  CyclicVelocity & WithTorqueOffset(TorqueSetpoint v) {torqueOffset = v; return *this;}
 };
 
 
 // Cyclic Synchronous Torque Mode, section 3.8 (p.3-44).
 struct CyclicTorque
 {
-  std::int16_t torque{0};  // 0x6071, per thousand of Motor rated torque
+  // 0x6071. Raw: thousandths of «Motor rated torque» (0x6076). As a torque,
+  // e.g. WithTorque(0.5_Nm), it is resolved against the motor's rated torque,
+  // which the motor data (MotorConfigs) must have set.
+  TorqueSetpoint torque{0};
 
-  std::optional<std::int16_t> torqueOffset;  // 0x60B2
+  std::optional<TorqueSetpoint> torqueOffset;  // 0x60B2, added to the target
 
   static constexpr auto kMode = signals::OperationMode::kCyclicSynchronousTorque;
 
-  CyclicTorque & WithTorque(std::int16_t v) {torque = v; return *this;}
-  CyclicTorque & WithTorqueOffset(std::int16_t v) {torqueOffset = v; return *this;}
+  CyclicTorque & WithTorque(TorqueSetpoint v) {torque = v; return *this;}
+  CyclicTorque & WithTorqueOffset(TorqueSetpoint v) {torqueOffset = v; return *this;}
 };
 
 
