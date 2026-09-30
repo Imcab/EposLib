@@ -231,7 +231,7 @@ struct HomingConfigs
   std::optional<std::uint32_t> acceleration;          // 0x609A
   std::optional<std::int32_t> homePosition;           // 0x30B0
   std::optional<std::int32_t> homeOffsetMoveDistance;  // 0x30B1
-  std::optional<std::int16_t> currentThreshold;        // 0x30B2 [mA]
+  std::optional<std::uint16_t> currentThreshold;       // 0x30B2 [mA], UNSIGNED16
 
   void AppendTo(ConfigWrites & out) const;
 };

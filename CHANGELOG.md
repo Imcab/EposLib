@@ -18,6 +18,26 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Added
 
+- `SetPosition(position)`: declares the axis to be somewhere without moving
+  it - homing method 37, «Actual position», with the Home offset move
+  distance zeroed for the run. The homing method, 0x30B0, 0x30B1 and the
+  operating mode are restored afterwards.
+- Digital outputs: `SetDigitalOutput(function, active)`,
+  `IsOutputActive()`, `GetDigitalOutputs()` (0x60FE, by function) and
+  `GetDigitalOutputPins()` (0x3150:01, by pin, after polarity). The
+  drive-owned holding brake and Ready/Fault bits are refused.
+- Touch probe 1: `controls::TouchProbe` (trigger, edges, single or
+  continuous, encoded per Table 6-164 and validated against its notes),
+  `ArmTouchProbe()`, `DisarmTouchProbe()`, and `GetTouchProbe()` returning
+  status, both latched positions and both edge counters together.
+- Statusword signals that were missing: `IsPositionReferenced()` (bit 15),
+  `HasHomingError()`, `IsAtZeroSpeed()` (PVM bit 12), `IsFollowingCommand()`
+  (CSP/CSV/CST bit 12), `IsRemote()`, `IsVoltageEnabled()`.
+- `epos4_sim` implements Homing Mode against a virtual axis - end stops,
+  limit switches, a home switch and an index per revolution - covering
+  every method of section 3.5.3; plus digital output pins and touch probe
+  latching. `Home()` and `SetPosition()` had never been executed before.
+
 - **The lock-free cyclic path for velocity and torque**, next to position:
   `EnterCyclicVelocityMode()` / `EnterCyclicTorqueMode()` and
   `StageTargetVelocity()` / `StageTargetTorque()`. Each SYNC publishes the
@@ -121,6 +141,18 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Fixed
 
+- **`Home()` could report a run attained that had not started, and a
+  second PPM move could be taken as accepted without the drive seeing
+  it.** With the Controlword in a synchronous RPDO, the drive applies it
+  at the SYNC after it arrives and answers on the TPDO of the SYNC after
+  that; reading the Statusword before then returned the previous run's
+  bits. The handshakes now wait for a PDO after the third SYNC, both after
+  raising bit 4 and after lowering it, so every edge reaches the drive.
+  Measured on the bus: 20 ms at a 10 ms SYNC.
+- `Home()` refused homing when the limit switch was mapped as the
+  "without limit error" variant (24, 25), which section 6.2.75 reserves
+  for exactly that use. `signals::SatisfiesHomingInput()` accepts both.
+- `HomingConfigs::currentThreshold` was `int16_t`; 0x30B2 is UNSIGNED16.
 - The cyclic `SetControl()` overloads switched the drive's mode before
   validating the request; a request that could not be converted then
   failed with the mode already changed. Everything is resolved first now.

@@ -238,7 +238,7 @@ HomingConfigs::AppendTo(ConfigWrites & out) const
   Put<std::int32_t, std::int32_t>(
     out, od::At(
       od::maxon::kHomeOffsetMoveDistance), homeOffsetMoveDistance);
-  Put<std::int16_t, std::int16_t>(
+  Put<std::uint16_t, std::uint16_t>(
     out, od::At(
       od::maxon::kCurrentThresholdForHomingMode), currentThreshold);
 }

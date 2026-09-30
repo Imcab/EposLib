@@ -30,6 +30,7 @@
 #include <lely/io2/sys/sigset.hpp>
 #include <lely/io2/sys/timer.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -228,6 +229,7 @@ private:
       SetIdentity();
       SetMeasurements();
       commResetPending_ = false;
+      positionReferenced_ = false;
       (*this)[0x603F][0] = std::uint16_t{0};
       SetState(sig::State::kNotReadyToSwitchOn);
       last_cw_ = 0;
@@ -292,6 +294,30 @@ private:
   // verified end to end. Velocity follows its command through a first-order
   // lag; under torque, velocity grows with the torque against a damping
   // term, so a constant torque settles at a constant speed.
+  // --- Homing Mode, section 3.5 ---
+  //
+  // A virtual axis to home against: mechanical end stops at +-kEndStop, a
+  // limit switch at each of them, a home switch across [kHomeSwitchLow,
+  // kHomeSwitchHigh], and an encoder index once per revolution. Every method
+  // of section 3.5.3 finds its event on it, travels the Home offset move
+  // distance (0x30B1), and there sets Home position (0x30B0).
+  //
+  // A method whose switch is not mapped in 0x3142 never sees its edge: the
+  // search runs into the end stop and ends in «Homing error», which is what
+  // the drive would do.
+  static constexpr std::int32_t kEndStop = 50000;
+  static constexpr std::int32_t kHomeSwitchLow = 20000;
+  static constexpr std::int32_t kHomeSwitchHigh = 22000;
+
+  enum class HomingPhase {kIdle, kSearch, kOffset};
+  HomingPhase homingPhase_{HomingPhase::kIdle};
+  std::int32_t homingGoal_{0};
+  std::int32_t homingOffsetGoal_{0};
+  bool homingAttained_{false};
+  bool homingError_{false};
+  bool positionReferenced_{false};  // bit 15, survives leaving the mode
+  bool lastHomingStart_{false};
+
   std::int32_t commandedRpm_{0};
   std::int16_t commandedTorque_{0};  // thousandths of rated torque
   double velocityRpm_{0.0};
@@ -425,6 +451,273 @@ private:
     return resolution == 0 ? 2000.0 : static_cast<double>(resolution);
   }
 
+  // Whether a digital input is mapped to one of the given functions in
+  // 0x3142 - the check the drive makes before it can see a switch.
+  bool
+  InputMapped(std::uint8_t function, std::uint8_t alternative)
+  {
+    for (std::uint8_t sub = 1; sub <= 8; ++sub) {
+      const std::uint8_t mapped = (*this)[0x3142][sub];
+      if (mapped == function || mapped == alternative) {return true;}
+    }
+    return false;
+  }
+
+  // The next index pulse from `from`, strictly in direction `dir`: pulses
+  // sit at every multiple of a revolution. Floor division, so negative
+  // positions round the same way as positive ones.
+  std::int32_t
+  NextIndex(std::int32_t from, int dir)
+  {
+    const auto rev = static_cast<std::int32_t>(CountsPerRevolution());
+    auto floorDiv = [](std::int32_t a, std::int32_t b) {
+        return a / b - ((a % b != 0) && ((a < 0) != (b < 0)) ? 1 : 0);
+      };
+    if (dir > 0) {
+      return (floorDiv(from, rev) + 1) * rev;
+    }
+    return -(floorDiv(-from, rev) + 1) * rev;
+  }
+
+  // Homing operation start (Controlword bit 4), rising edge: plan the run.
+  void
+  StartHoming()
+  {
+    using M = sig::HomingMethod;
+    const auto method = static_cast<M>(std::int8_t{(*this)[0x6098][0]});
+    const std::int32_t offset = (*this)[0x30B1][0];
+    const bool negLimit = InputMapped(0, 24);
+    const bool posLimit = InputMapped(1, 25);
+    const bool homeSwitch = InputMapped(2, 2);
+
+    homingAttained_ = false;
+    homingError_ = false;
+    targetReached_ = false;
+
+    // Event: where the method detects its reference. Away: the direction
+    // the offset move travels, away from a stop or switch at the side.
+    std::int32_t event = position_;
+    int away = offset >= 0 ? 1 : -1;
+    bool reachable = true;
+    switch (method) {
+      case M::kActualPosition: event = position_; break;
+      case M::kCurrentThresholdPositiveSpeed: event = kEndStop; away = -1; break;
+      case M::kCurrentThresholdNegativeSpeed: event = -kEndStop; away = 1; break;
+      case M::kCurrentThresholdPositiveSpeedAndIndex:
+        event = NextIndex(kEndStop, -1); away = -1; break;
+      case M::kCurrentThresholdNegativeSpeedAndIndex:
+        event = NextIndex(-kEndStop, 1); away = 1; break;
+      case M::kNegativeLimitSwitch: event = -kEndStop; away = 1; reachable = negLimit; break;
+      case M::kPositiveLimitSwitch: event = kEndStop; away = -1; reachable = posLimit; break;
+      case M::kNegativeLimitSwitchAndIndex:
+        event = NextIndex(-kEndStop, 1); away = 1; reachable = negLimit; break;
+      case M::kPositiveLimitSwitchAndIndex:
+        event = NextIndex(kEndStop, -1); away = -1; reachable = posLimit; break;
+      case M::kHomeSwitchPositiveSpeed: event = kHomeSwitchLow; reachable = homeSwitch; break;
+      case M::kHomeSwitchNegativeSpeed: event = kHomeSwitchHigh; reachable = homeSwitch; break;
+      case M::kHomeSwitchPositiveSpeedAndIndex:
+        event = NextIndex(kHomeSwitchLow, 1); reachable = homeSwitch; break;
+      case M::kHomeSwitchNegativeSpeedAndIndex:
+        event = NextIndex(kHomeSwitchHigh, -1); reachable = homeSwitch; break;
+      case M::kIndexNegativeSpeed: event = NextIndex(position_, -1); break;
+      case M::kIndexPositiveSpeed: event = NextIndex(position_, 1); break;
+      default:
+        printf(
+          "[sim] homing method %d not supported -> homing error\n",
+          static_cast<int>(method));
+        homingError_ = true;
+        PublishStatusword();
+        return;
+    }
+
+    if (!reachable) {
+      // The switch is never seen: the search drives into the end stop on
+      // that side and stalls there.
+      event = (method == M::kPositiveLimitSwitch || method == M::kPositiveLimitSwitchAndIndex ||
+        method == M::kHomeSwitchPositiveSpeed || method == M::kHomeSwitchPositiveSpeedAndIndex) ?
+        kEndStop : -kEndStop;
+      printf(
+        "[sim] homing method %d: its switch is not mapped in 0x3142, searching blind\n",
+        static_cast<int>(method));
+    }
+
+    homingGoal_ = event;
+    homingOffsetGoal_ = reachable ? event + away * (offset >= 0 ? offset : -offset) : event;
+    homingPhase_ = HomingPhase::kSearch;
+    stallOnArrival_ = !reachable;
+    printf(
+      "[sim] homing method %d: search to %d, offset move to %d\n",
+      static_cast<int>(method), homingGoal_, homingOffsetGoal_);
+    moving_ = true;
+    PublishStatusword();
+    ArmMotion();
+  }
+
+  bool stallOnArrival_{false};
+
+  // One tick of a homing run: towards the event at «Speed for switch search»
+  // (0x6099:01), then the offset move, then Home position.
+  void
+  StepHoming(std::int32_t tickMs)
+  {
+    const std::uint32_t rpm = (*this)[0x6099][1];
+    std::int32_t step = static_cast<std::int32_t>(
+      (rpm == 0 ? 100.0 : rpm) / 60.0 * CountsPerRevolution() * tickMs / 1000.0);
+    if (step < 1) {step = 1;}
+
+    const std::int32_t goal = homingPhase_ ==
+      HomingPhase::kSearch ? homingGoal_ : homingOffsetGoal_;
+    const std::int32_t remaining = goal - position_;
+    position_ = std::abs(remaining) <= step ? goal : position_ + (remaining > 0 ? step : -step);
+
+    // Pressing into an end stop is what the current threshold methods sense.
+    SetCurrent(true);
+    if (std::abs(position_) >= kEndStop) {
+      const std::uint16_t threshold = (*this)[0x30B2][0];
+      (*this)[0x30D1][1] = static_cast<std::int32_t>(threshold + 500);
+    }
+    PublishDigitalInputs();
+
+    if (position_ != goal) {return;}
+
+    if (stallOnArrival_) {
+      printf("[sim] homing: stalled at the end stop without seeing the switch -> homing error\n");
+      homingPhase_ = HomingPhase::kIdle;
+      homingError_ = true;
+      moving_ = false;
+      stallOnArrival_ = false;
+      return;
+    }
+    if (homingPhase_ == HomingPhase::kSearch) {
+      homingPhase_ = HomingPhase::kOffset;
+      return;
+    }
+
+    // Offset move done: this point is the Home position.
+    const std::int32_t home = (*this)[0x30B0][0];
+    printf("[sim] homing attained: position %d is now %d\n", position_, home);
+    position_ = home;
+    homingPhase_ = HomingPhase::kIdle;
+    homingAttained_ = true;
+    positionReferenced_ = true;
+    targetReached_ = true;
+    moving_ = false;
+    SetCurrent(false);
+  }
+
+  // --- Touch probe 1, sections 6.2.134-142 ---
+  //
+  // The input mapped to «Touch probe» (0x3142 = 26) sees a sensor across the
+  // same stretch as the home switch; the index trigger sees a pulse
+  // kIndexWidth counts wide at every revolution. Edges are found exactly
+  // between two positions, so the latched value is the edge position, not
+  // wherever the tick happened to land.
+  static constexpr std::int32_t kIndexWidth = 4;
+  std::uint16_t touchProbeFunction_{0};
+  std::uint16_t positiveEdges_{0};
+  std::uint16_t negativeEdges_{0};
+
+  void
+  ConfigureTouchProbe()
+  {
+    touchProbeFunction_ = (*this)[0x60B8][0];
+    positiveEdges_ = 0;
+    negativeEdges_ = 0;
+    std::uint16_t status = (touchProbeFunction_ & 1u) ? 1u : 0u;
+    (*this)[0x60B9][0] = status;
+    (*this)[0x60D5][0] = positiveEdges_;
+    (*this)[0x60D6][0] = negativeEdges_;
+  }
+
+  // Every rising and falling edge of the probed signal between `from` and
+  // `to`, in the order the axis meets them.
+  void
+  SampleTouchProbe(std::int32_t from, std::int32_t to)
+  {
+    if (!(touchProbeFunction_ & 1u) || from == to) {return;}
+    const bool index = ((touchProbeFunction_ >> 2) & 3u) == 1u;
+    if (!index && !InputMapped(26, 26)) {return;}
+
+    const int dir = to > from ? 1 : -1;
+    auto crossing = [&](std::int32_t low, std::int32_t high) {
+        // Entering the active stretch is the rising edge, leaving it the
+        // falling one - at `low` or `high` depending on the direction.
+        const std::int32_t enter = dir > 0 ? low : high;
+        const std::int32_t leave = dir > 0 ? high : low;
+        auto passes = [&](std::int32_t p) {
+            return dir > 0 ? (p > from && p <= to) : (p < from && p >= to);
+          };
+        if (passes(enter)) {Latch(true, enter);}
+        if (passes(leave)) {Latch(false, leave);}
+      };
+    if (!index) {
+      crossing(kHomeSwitchLow, kHomeSwitchHigh);
+      return;
+    }
+    const auto rev = static_cast<std::int32_t>(CountsPerRevolution());
+    const std::int32_t lo = std::min(from, to), hi = std::max(from, to);
+    for (std::int32_t k = (lo / rev) - 1; k <= (hi / rev) + 1; ++k) {
+      crossing(k * rev, k * rev + kIndexWidth);
+    }
+  }
+
+  void
+  Latch(bool positive, std::int32_t position)
+  {
+    const bool continuous = (touchProbeFunction_ & (1u << 1)) != 0;
+    const bool wanted =
+      positive ? (touchProbeFunction_ & (1u << 4)) : (touchProbeFunction_ & (1u << 5));
+    std::uint16_t & count = positive ? positiveEdges_ : negativeEdges_;
+    if (!wanted || (!continuous && count > 0)) {return;}
+    ++count;
+    std::uint16_t status = (*this)[0x60B9][0];
+    if (positive) {
+      (*this)[0x60BA][0] = position;
+      (*this)[0x60D5][0] = count;
+      status |= 1u << 1;
+    } else {
+      (*this)[0x60BB][0] = position;
+      (*this)[0x60D6][0] = count;
+      status |= 1u << 2;
+    }
+    (*this)[0x60B9][0] = status;
+    printf(
+      "[sim] touch probe: %s edge latched at %d (count %u)\n",
+      positive ? "positive" : "negative", position, count);
+  }
+
+  // 0x3150:01, the pins: each output pin (0x3151:01..03) shows the state of
+  // the function assigned to it in 0x60FE:01, inverted where its bit in
+  // «Digital outputs polarity» (0x3150:02) is set - sections 6.2.76-77.
+  void
+  PublishDigitalOutputPins()
+  {
+    const std::uint32_t functions = (*this)[0x60FE][1];
+    const std::uint16_t polarity = (*this)[0x3150][2];
+    std::uint16_t pins = 0;
+    for (std::uint8_t sub = 1; sub <= 3; ++sub) {
+      const std::uint8_t function = (*this)[0x3151][sub];
+      bool state = function != 255 && ((functions >> function) & 1u);
+      if ((polarity >> (sub - 1)) & 1u) {state = !state;}
+      if (state) {pins |= static_cast<std::uint16_t>(1u << (sub - 1));}
+    }
+    (*this)[0x3150][1] = pins;
+  }
+
+  // 0x60FD, by function: bit 0 negative limit, bit 1 positive limit, bit 2
+  // home switch - each only if an input is mapped to it, as on the drive.
+  void
+  PublishDigitalInputs()
+  {
+    std::uint32_t bits = 0;
+    if (position_ <= -kEndStop && InputMapped(0, 24)) {bits |= 1u << 0;}
+    if (position_ >= kEndStop && InputMapped(1, 25)) {bits |= 1u << 1;}
+    if (position_ >= kHomeSwitchLow && position_ <= kHomeSwitchHigh && InputMapped(2, 2)) {
+      bits |= 1u << 2;
+    }
+    (*this)[0x60FD][0] = bits;
+  }
+
   // A crude but honest trapezoid-free ramp: step towards the target at the
   // profile velocity. Enough to exercise Target reached and the handshake;
   // not a claim to model the drive's real trajectory generator.
@@ -435,6 +728,20 @@ private:
 
     constexpr std::int32_t kTickMs = 20;
     const std::int32_t before = position_;
+
+    if (homingPhase_ != HomingPhase::kIdle) {
+      StepHoming(kTickMs);
+      // «After homing, all touch probe states and latched positions are
+      // cleared» (6.2.134) - and the two cannot run at the same time.
+      if (homingPhase_ == HomingPhase::kIdle && homingAttained_) {ConfigureTouchProbe();}
+      positionExact_ = position_;
+      (*this)[0x6064][0] = position_;
+      (*this)[0x606C][0] = static_cast<std::int32_t>(
+        (position_ - before) * 60.0 * 1000.0 / kTickMs / CountsPerRevolution());
+      PublishStatusword();
+      if (moving_) {ArmMotion();}
+      return;
+    }
 
     const auto mode = static_cast<sig::OperationMode>(std::int8_t{(*this)[0x6061][0]});
     if (mode == sig::OperationMode::kCyclicSynchronousVelocity ||
@@ -450,6 +757,7 @@ private:
       }
       positionExact_ += velocityRpm_ / 60.0 * CountsPerRevolution() * dt;
       position_ = static_cast<std::int32_t>(positionExact_);
+      SampleTouchProbe(before, position_);
       (*this)[0x6064][0] = position_;
       (*this)[0x606C][0] = static_cast<std::int32_t>(velocityRpm_);
       (*this)[0x6077][0] = torqueActual_;
@@ -477,6 +785,7 @@ private:
       position_ += (remaining > 0) ? stepSize : -stepSize;
     }
 
+    SampleTouchProbe(before, position_);
     (*this)[0x6064][0] = position_;
     positionExact_ = position_;
     // Velocity actual from how far this tick moved; torque is not modelled
@@ -535,6 +844,13 @@ private:
     // Bit 12 under CSP is «Drive follows command value», not «Setpoint
     // acknowledge». Same bit, different meaning, decided by 0x6061.
     if (cyclicFollowing_) {sw |= sig::status_bits::kFollowsCommandValue;}
+    // Bits 12 and 13 mean «Homing attained» and «Homing error» only in HMM.
+    const auto mode = static_cast<sig::OperationMode>(std::int8_t{(*this)[0x6061][0]});
+    if (mode == sig::OperationMode::kHoming) {
+      if (homingAttained_) {sw |= sig::status_bits::kHomingAttained;}
+      if (homingError_) {sw |= sig::status_bits::kHomingError;}
+    }
+    if (positionReferenced_) {sw |= sig::status_bits::kHomeRefValid;}
     (*this)[0x6041][0] = sw;
   }
 
@@ -548,6 +864,7 @@ private:
       moving_ = false;
       setpointAcknowledged_ = false;
       cyclicFollowing_ = false;
+      homingPhase_ = HomingPhase::kIdle;
       commandedRpm_ = 0;
       commandedTorque_ = 0;
       velocityRpm_ = 0.0;
@@ -603,10 +920,34 @@ private:
         state_ == sig::State::kOperationEnabled)
       {
         HandlePpm(cw);
+      } else if (activeMode == sig::OperationMode::kHoming &&
+        state_ == sig::State::kOperationEnabled)
+      {
+        HandleHoming(cw);
       } else if (state_ == sig::State::kOperationEnabled) {
         HandleCyclicTarget(activeMode);
       }
     }
+  }
+
+  // Controlword under HMM (Table 3-29): bit 4 starts the run on its rising
+  // edge, bit 8 «Halt» stops it - Target reached without Homing attained,
+  // which Table 3-33 reads as "interrupted".
+  void
+  HandleHoming(std::uint16_t cw)
+  {
+    const bool start = (cw & sig::control_bits::kHomingOperationStart) != 0;
+    const bool halt = (cw & sig::control_bits::kHalt) != 0;
+    if (halt && homingPhase_ != HomingPhase::kIdle) {
+      printf("[sim] homing halted\n");
+      homingPhase_ = HomingPhase::kIdle;
+      moving_ = false;
+      targetReached_ = true;
+    } else if (start && !lastHomingStart_ && !halt) {
+      StartHoming();
+    }
+    lastHomingStart_ = start;
+    PublishStatusword();
   }
 
   // The cyclic modes have no handshake: the drive follows whatever target
@@ -652,6 +993,10 @@ private:
             HandleCyclicTarget(static_cast<sig::OperationMode>(mode));
           });
       }
+    } else if (idx == 0x60B8 && subidx == 0) {
+      ConfigureTouchProbe();
+    } else if (idx == 0x60FE || idx == 0x3151 || (idx == 0x3150 && subidx == 2)) {
+      PublishDigitalOutputPins();
     } else if (idx == 0x6060 && subidx == 0) {
       // Modes of operation: echo the request into Modes of operation display,
       // which is what a real drive does once it has actually switched.

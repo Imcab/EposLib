@@ -218,6 +218,22 @@ RequiredInput(HomingMethod method)
 }
 
 bool
+SatisfiesHomingInput(DigitalInputFunction mapped, DigitalInputFunction required)
+{
+  if (mapped == required) {
+    return true;
+  }
+  switch (required) {
+    case DigitalInputFunction::kNegativeLimitSwitch:
+      return mapped == DigitalInputFunction::kNegativeLimitSwitchNoError;
+    case DigitalInputFunction::kPositiveLimitSwitch:
+      return mapped == DigitalInputFunction::kPositiveLimitSwitchNoError;
+    default:
+      return false;
+  }
+}
+
+bool
 RequiresEncoderIndex(HomingMethod method)
 {
   switch (method) {

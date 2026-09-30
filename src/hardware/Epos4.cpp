@@ -184,6 +184,10 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // setpoint the control loop staged rides this cycle rather than the next.
   void OnSync(std::uint8_t, const time_point &) noexcept override
   {
+    syncCount.fetch_add(1, std::memory_order_release);
+    lastSync.store(
+      std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+
     if (!cyclic.IsActive()) {
       return;
     }
@@ -310,6 +314,58 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
     return Write<T>(entry, value);
   }
 
+  // SYNCs seen, and when the last one was. See AwaitCommandApplied().
+  std::atomic<std::uint32_t> syncCount{0};
+  std::atomic<long long> lastSync{0};
+
+  // Waits until a Controlword just written has reached the drive AND the
+  // drive's answer to it has come back, so the next Statusword read
+  // reflects the command rather than what came before it.
+  //
+  // With the Controlword in an RPDO of transmission type 1 it takes three
+  // SYNCs, and CiA 301 is why: the write leaves with SYNC n; a synchronous
+  // RPDO is not applied on reception but at the NEXT SYNC, n+1, whose TPDO
+  // was already sampled; so the first Statusword that reflects the command
+  // is the TPDO of SYNC n+2. Measured on the bus: at a 10 ms SYNC, bit 4
+  // left at 0 ms and the drive's answer arrived at 20 ms.
+  //
+  // Reading earlier returns the previous state - for a handshake, the
+  // previous handshake's answer. That made Home() report a run attained
+  // (bits 12 and 10 still set from the last one) while the axis was still
+  // searching, and it could do the same to a second PPM move.
+  //
+  // Without SYNC running, writes and reads go over SDO, which is already
+  // in order: nothing to wait for.
+  void AwaitCommandApplied()
+  {
+    const auto now = std::chrono::steady_clock::now();
+    const auto last = std::chrono::steady_clock::time_point{
+      std::chrono::steady_clock::duration{lastSync.load(std::memory_order_relaxed)}};
+    if (lastSync.load(std::memory_order_relaxed) == 0 ||
+      now - last > std::chrono::milliseconds{100})
+    {
+      return;
+    }
+    const std::uint32_t start = syncCount.load(std::memory_order_acquire);
+    const auto deadline = now + std::chrono::milliseconds{250};
+
+    // Three SYNCs, then a PDO received after the third: its TPDO arrives a
+    // moment AFTER the master counts that SYNC, so the SYNC alone is not
+    // enough.
+    constexpr std::uint32_t kSyncsUntilAnswered = 3;
+    while (syncCount.load(std::memory_order_acquire) - start < kSyncsUntilAnswered) {
+      if (std::chrono::steady_clock::now() >= deadline) {return;}
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    const auto answeringSync = std::chrono::steady_clock::time_point{
+      std::chrono::steady_clock::duration{lastSync.load(std::memory_order_relaxed)}};
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto t = std::chrono::steady_clock::now();
+      if (t - cyclic.TimeSinceLastPdo(t) >= answeringSync) {return;}
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
+
   // Everything the cyclic path shares between the control thread and this
   // one: the last feedback received, the staged setpoint, and the rule for
   // trusting them. Lock-free throughout; see core::CyclicState.
@@ -366,10 +422,18 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   signals::StatusSignal<bool> homingAttained;
   signals::StatusSignal<bool> internalLimit;
   signals::StatusSignal<bool> warning;
+  signals::StatusSignal<bool> homingError;
+  signals::StatusSignal<bool> atZeroSpeed;
+  signals::StatusSignal<bool> followingCommand;
+  signals::StatusSignal<bool> positionReferenced;
+  signals::StatusSignal<bool> remote;
+  signals::StatusSignal<bool> voltageEnabled;
   signals::StatusSignal<signals::BrakeState> brakeState;
   signals::StatusSignal<std::uint32_t> digitalInputs;
   signals::StatusSignal<std::uint32_t> motorRatedTorque;
   signals::StatusSignal<std::uint16_t> digitalInputPins;
+  signals::StatusSignal<std::uint32_t> digitalOutputs;
+  signals::StatusSignal<std::uint16_t> digitalOutputPins;
 
   signals::StatusSignal<units::current::ampere_t> motorCurrent;
   signals::StatusSignal<units::current::ampere_t> motorCurrentAveraged;
@@ -720,6 +784,13 @@ Epos4::Attach(lely_master_t & master)
   d.homingAttained = signals::StatusSignal<bool>(bit(signals::status_bits::kHomingAttained));
   d.internalLimit = signals::StatusSignal<bool>(bit(signals::status_bits::kInternalLimit));
   d.warning = signals::StatusSignal<bool>(bit(signals::status_bits::kWarning));
+  d.homingError = signals::StatusSignal<bool>(bit(signals::status_bits::kHomingError));
+  d.atZeroSpeed = signals::StatusSignal<bool>(bit(signals::status_bits::kSpeed));
+  d.followingCommand =
+    signals::StatusSignal<bool>(bit(signals::status_bits::kFollowsCommandValue));
+  d.positionReferenced = signals::StatusSignal<bool>(bit(signals::status_bits::kHomeRefValid));
+  d.remote = signals::StatusSignal<bool>(bit(signals::status_bits::kRemote));
+  d.voltageEnabled = signals::StatusSignal<bool>(bit(signals::status_bits::kVoltageEnabled));
 
   d.motorRatedTorque = signals::StatusSignal<std::uint32_t>(
     [&d](std::uint32_t & out) {
@@ -729,6 +800,16 @@ Epos4::Attach(lely_master_t & master)
   d.digitalInputs = signals::StatusSignal<std::uint32_t>(
     [&d](std::uint32_t & out) {
       return d.ReadPreferPdo<std::uint32_t>(od::At(od::cia402::kDigitalInputs), out);
+    });
+
+  d.digitalOutputs = signals::StatusSignal<std::uint32_t>(
+    [&d](std::uint32_t & out) {
+      return d.ReadPreferPdo<std::uint32_t>(od::cia402::kDigitalOutputs_PhysicalOutputs, out);
+    });
+  d.digitalOutputPins = signals::StatusSignal<std::uint16_t>(
+    [&d](std::uint16_t & out) {
+      return d.ReadPreferPdo<std::uint16_t>(
+        od::maxon::kDigitalOutputProperties_DigitalOutputsLogicState, out);
     });
 
   d.digitalInputPins = signals::StatusSignal<std::uint16_t>(
@@ -1036,6 +1117,7 @@ Epos4::SetControl(const controls::ProfilePosition & request)
   // the caller.
   d.controlword.SetModeBits(signals::control_bits::kNewSetpoint);
   if (auto ec = d.WriteControlword()) {return ec;}
+  d.AwaitCommandApplied();
 
   bool acknowledged = false;
   for (int i = 0; i < 200; ++i) {
@@ -1050,6 +1132,10 @@ Epos4::SetControl(const controls::ProfilePosition & request)
 
   d.controlword.ClearModeBits(signals::control_bits::kNewSetpoint);
   if (auto ec = d.WriteControlword()) {return ec;}
+  // Let the drive see bit 4 low before anyone raises it again: the setpoint
+  // is taken on its rising edge, and a next move that raised it within the
+  // same SYNC period would produce no edge and no move.
+  d.AwaitCommandApplied();
 
   if (!acknowledged) {
     return std::make_error_code(std::errc::timed_out);
@@ -1207,6 +1293,59 @@ Epos4::SetControl(const controls::Halt &)
   return Halt();
 }
 
+std::error_code
+Epos4::SetPosition(PositionSetpoint position, std::chrono::milliseconds timeout)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  auto & d = *impl_;
+
+  std::int32_t counts{};
+  if (!Resolve(position, GetMechanism(), counts)) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  // Homing only starts from «Operation enabled»; without this check the run
+  // below would simply time out with nothing said about why.
+  if (!IsEnabled()) {
+    return std::make_error_code(std::errc::operation_not_permitted);
+  }
+
+  // What this borrows, to give it back afterwards.
+  std::int8_t method{};
+  std::int32_t homePosition{};
+  std::int32_t offsetDistance{};
+  std::int8_t mode{};
+  if (auto ec = d.Read(od::At(od::cia402::kHomingMethod), method)) {return ec;}
+  if (auto ec = d.Read(od::At(od::maxon::kHomePosition), homePosition)) {return ec;}
+  if (auto ec = d.Read(od::At(od::maxon::kHomeOffsetMoveDistance), offsetDistance)) {return ec;}
+  if (auto ec = d.Read(od::At(od::cia402::kModesOfOperationDisplay), mode)) {return ec;}
+
+  std::error_code result;
+  if (auto ec = d.Write<std::int32_t>(od::At(od::maxon::kHomePosition), counts)) {
+    result = ec;
+  } else if (auto ec2 = d.Write<std::int32_t>(od::At(od::maxon::kHomeOffsetMoveDistance), 0)) {
+    result = ec2;
+  } else if (!Home(
+      controls::Homing{}.WithMethod(signals::HomingMethod::kActualPosition),
+      timeout))
+  {
+    result = std::make_error_code(std::errc::timed_out);
+  }
+
+  // Restored whatever happened above: a failed SetPosition must not leave
+  // somebody's homing configuration replaced by method 37 and a zero offset.
+  // The first restore error is reported only if the run itself succeeded.
+  auto restore = [&result](std::error_code ec) {
+      if (ec && !result) {result = ec;}
+    };
+  restore(d.Write<std::int8_t>(od::At(od::cia402::kHomingMethod), method));
+  restore(d.Write<std::int32_t>(od::At(od::maxon::kHomePosition), homePosition));
+  restore(d.Write<std::int32_t>(od::At(od::maxon::kHomeOffsetMoveDistance), offsetDistance));
+  if (mode != static_cast<std::int8_t>(signals::OperationMode::kHoming)) {
+    restore(d.EnsureMode(static_cast<signals::OperationMode>(mode)));
+  }
+  return result;
+}
+
 bool
 Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
 {
@@ -1232,7 +1371,8 @@ Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
               od::At(od::maxon::kConfigurationOfDigitalInputs, sub), function) ==
             std::error_code{})
           {
-            assigned = (function == static_cast<std::uint8_t>(*required));
+            assigned = signals::SatisfiesHomingInput(
+              static_cast<signals::DigitalInputFunction>(function), *required);
           }
         }
         if (!assigned) {
@@ -1254,6 +1394,7 @@ Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
   // the mode is set first.
   d.controlword.SetModeBits(signals::control_bits::kHomingOperationStart);
   if (d.WriteControlword()) {return false;}
+  d.AwaitCommandApplied();
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   bool attained = false;
@@ -1279,6 +1420,9 @@ Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
 
   d.controlword.ClearModeBits(signals::control_bits::kHomingOperationStart);
   d.WriteControlword();
+  // As for PPM: the run starts on the rising edge of bit 4, so the low has
+  // to reach the drive before a following Home() raises it again.
+  d.AwaitCommandApplied();
   return attained;
 }
 
@@ -1325,12 +1469,116 @@ signals::StatusSignal<bool> & Epos4::HasFollowingError() {return impl_->followin
 signals::StatusSignal<bool> & Epos4::IsHomingAttained() {return impl_->homingAttained;}
 signals::StatusSignal<bool> & Epos4::IsInternalLimitActive() {return impl_->internalLimit;}
 signals::StatusSignal<bool> & Epos4::HasWarning() {return impl_->warning;}
+signals::StatusSignal<bool> & Epos4::HasHomingError() {return impl_->homingError;}
+signals::StatusSignal<bool> & Epos4::IsAtZeroSpeed() {return impl_->atZeroSpeed;}
+signals::StatusSignal<bool> & Epos4::IsFollowingCommand() {return impl_->followingCommand;}
+signals::StatusSignal<bool> & Epos4::IsPositionReferenced() {return impl_->positionReferenced;}
+signals::StatusSignal<bool> & Epos4::IsRemote() {return impl_->remote;}
+signals::StatusSignal<bool> & Epos4::IsVoltageEnabled() {return impl_->voltageEnabled;}
 signals::StatusSignal<signals::BrakeState> & Epos4::GetBrakeState() {return impl_->brakeState;}
 signals::StatusSignal<std::uint32_t> & Epos4::GetDigitalInputs() {return impl_->digitalInputs;}
 signals::StatusSignal<std::uint32_t> & Epos4::GetMotorRatedTorque()
 {
   return impl_->motorRatedTorque;
 }
+signals::StatusSignal<std::uint32_t> & Epos4::GetDigitalOutputs()
+{
+  return impl_->digitalOutputs;
+}
+
+signals::StatusSignal<std::uint16_t> & Epos4::GetDigitalOutputPins()
+{
+  return impl_->digitalOutputPins;
+}
+
+std::error_code
+Epos4::SetDigitalOutput(signals::DigitalOutputFunction function, bool active)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  using F = signals::DigitalOutputFunction;
+  // Bits 24..31 of 0x60FE are read-only (Table 6-170): the holding brake
+  // and Ready/Fault belong to the drive, which sequences them itself.
+  if (function == F::kHoldingBrake || function == F::kReadyFault || function == F::kNone) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  auto & d = *impl_;
+
+  // Read-modify-write: 0x60FE:01 carries every output at once, and the
+  // others must keep whatever the host last set them to.
+  std::uint32_t outputs{};
+  if (auto ec = d.Read(od::cia402::kDigitalOutputs_PhysicalOutputs, outputs)) {return ec;}
+  const std::uint32_t bit = 1u << static_cast<std::uint8_t>(function);
+  outputs = active ? (outputs | bit) : (outputs & ~bit);
+  // Through the RPDO when mapped (RXPDO-mappable, section 6.2.148), as with
+  // every output - see WriteOutput.
+  return d.WriteOutput<std::uint32_t>(od::cia402::kDigitalOutputs_PhysicalOutputs, outputs);
+}
+
+bool
+Epos4::IsOutputActive(signals::DigitalOutputFunction function)
+{
+  if (function == signals::DigitalOutputFunction::kNone) {return false;}
+  auto & signal = GetDigitalOutputs();
+  if (signal.Refresh().GetStatus()) {return false;}
+  // As with the inputs, the function's value is its bit position in 0x60FE.
+  return (signal.GetValue() >> static_cast<std::uint8_t>(function)) & 1u;
+}
+
+std::error_code
+Epos4::ArmTouchProbe(const controls::TouchProbe & probe)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  if (!probe.IsValid()) {return std::make_error_code(std::errc::invalid_argument);}
+  auto & d = *impl_;
+
+  if (probe.trigger == controls::TouchProbe::Trigger::kInput) {
+    bool mapped = false;
+    for (std::uint8_t sub = 1; sub <= 8 && !mapped; ++sub) {
+      std::uint8_t function{};
+      if (!d.Read(od::At(od::maxon::kConfigurationOfDigitalInputs, sub), function)) {
+        mapped = function == static_cast<std::uint8_t>(signals::DigitalInputFunction::kTouchProbe);
+      }
+    }
+    if (!mapped) {return std::make_error_code(std::errc::invalid_argument);}
+  }
+
+  // A probe already enabled keeps its latched values; switching it off
+  // first makes each Arm() a fresh start, counters included.
+  if (auto ec = DisarmTouchProbe()) {return ec;}
+  return d.WriteOutput<std::uint16_t>(
+    od::At(od::cia402::kTouchProbeFunction), probe.ToFunctionWord());
+}
+
+std::error_code
+Epos4::DisarmTouchProbe()
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  return impl_->WriteOutput<std::uint16_t>(od::At(od::cia402::kTouchProbeFunction), 0);
+}
+
+std::error_code
+Epos4::GetTouchProbe(signals::TouchProbeState & out)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  auto & d = *impl_;
+  signals::TouchProbeState state;
+  std::uint16_t status{};
+  if (auto ec = d.Read(od::At(od::cia402::kTouchProbeStatus), status)) {return ec;}
+  signals::DecodeTouchProbeStatus(status, state);
+  if (auto ec = d.Read(od::At(od::cia402::kTouchProbe1PositiveEdge), state.positiveEdgePosition)) {
+    return ec;
+  }
+  if (auto ec = d.Read(od::At(od::cia402::kTouchProbe1NegativeEdge), state.negativeEdgePosition)) {
+    return ec;
+  }
+  if (auto ec = d.Read(
+      od::At(od::cia402::kTouchProbe1PositiveEdgeCounter), state.positiveEdgeCount)) {return ec;}
+  if (auto ec = d.Read(
+      od::At(od::cia402::kTouchProbe1NegativeEdgeCounter), state.negativeEdgeCount)) {return ec;}
+  out = state;
+  return {};
+}
+
 signals::StatusSignal<std::uint16_t> & Epos4::GetDigitalInputPins()
 {
   return impl_->digitalInputPins;

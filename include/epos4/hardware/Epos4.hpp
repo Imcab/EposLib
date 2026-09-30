@@ -22,6 +22,7 @@ using lely_master_t = lely::canopen::AsyncMaster;
 #include "epos4/signals/Errors.hpp"
 #include "epos4/signals/Identity.hpp"
 #include "epos4/signals/StatusSignal.hpp"
+#include "epos4/signals/TouchProbe.hpp"
 
 namespace epos4
 {
@@ -235,6 +236,25 @@ public:
     const controls::Homing & request,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{30000});
 
+  // Declares the axis to be at `position`, without moving it - the
+  // setPosition() of other APIs. On this drive that is homing method 37,
+  // «Actual position» (section 3.5.3.11): the current position becomes the
+  // Home position (0x30B0).
+  //
+  // Method 37 on an enabled drive first travels the «Home offset move
+  // distance» (0x30B1), so that is set to zero for the run. The homing
+  // method, 0x30B0 and 0x30B1 are then restored to what they held, and the
+  // operating mode too: this changes the reference, not the configuration.
+  //
+  //   motor.SetPosition(0);        // "here is zero"
+  //   motor.SetPosition(90_deg);   // at the output, via SetMechanism()
+  //
+  // The drive must be in «Operation enabled»; operation_not_permitted
+  // otherwise. Blocking; seconds at most.
+  std::error_code SetPosition(
+    PositionSetpoint position,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{3000});
+
   // -------------------------------------------------------------------------
   // Status signals. Each returns a cached signal; call Refresh() to go to the
   // bus. See StatusSignal for why that is explicit.
@@ -289,6 +309,19 @@ public:
   signals::StatusSignal<bool> & IsHomingAttained();     // bit 12, HMM
   signals::StatusSignal<bool> & IsInternalLimitActive();  // bit 11
   signals::StatusSignal<bool> & HasWarning();           // bit 7
+  signals::StatusSignal<bool> & HasHomingError();       // bit 13, HMM
+  signals::StatusSignal<bool> & IsAtZeroSpeed();        // bit 12, PVM: speed is 0
+  signals::StatusSignal<bool> & IsFollowingCommand();   // bit 12, CSP/CSV/CST
+
+  // Mode-independent (Table 6-148).
+  //
+  // Bit 15: the position is referenced to the home position. Set when
+  // homing is attained, cleared by a position counter overflow or a sensor
+  // error - after which a stored pose points somewhere else. Worth checking
+  // before any move to an absolute position on an incremental encoder.
+  signals::StatusSignal<bool> & IsPositionReferenced();
+  signals::StatusSignal<bool> & IsRemote();             // bit 9: NMT «Operational»
+  signals::StatusSignal<bool> & IsVoltageEnabled();     // bit 4: power stage on
 
   // -------------------------------------------------------------------------
   // Power and thermal
@@ -337,6 +370,51 @@ public:
   // Whether a given function is currently asserted, read from 0x60FD.
   // Refreshes the signal, so it costs a bus read unless PDOs are mapped.
   bool IsInputActive(signals::DigitalInputFunction function);
+
+  // -------------------------------------------------------------------------
+  // Digital outputs, the same two views as the inputs:
+  //
+  //   GetDigitalOutputs()     0x60FE:01, BY FUNCTION and before polarity:
+  //                           what the host and the drive command.
+  //   GetDigitalOutputPins()  0x3150:01, BY PIN and after polarity: what the
+  //                           terminals actually drive (Table 6-132).
+  //
+  // Which pin carries which function is DigitalOutputConfigs (0x3151).
+  // -------------------------------------------------------------------------
+  signals::StatusSignal<std::uint32_t> & GetDigitalOutputs();
+  signals::StatusSignal<std::uint16_t> & GetDigitalOutputPins();
+
+  // Sets or clears one output function in 0x60FE:01, leaving the others as
+  // they are. For the general purpose outputs A..C, and for the raw brake
+  // GPIO (kSetBrakeGpio) - which drives the brake pin with no timing and no
+  // standstill interlock, see GetBrakeState(). The holding brake and
+  // Ready/Fault are read-only there, belong to the drive, and are refused
+  // with invalid_argument.
+  std::error_code SetDigitalOutput(signals::DigitalOutputFunction function, bool active);
+  bool IsOutputActive(signals::DigitalOutputFunction function);
+
+  // -------------------------------------------------------------------------
+  // Touch probe 1 (sections 6.2.134-142). See controls::TouchProbe.
+  //
+  //   motor.ArmTouchProbe(controls::TouchProbe{}.WithNegativeEdge(true));
+  //   ... move past the sensor ...
+  //   signals::TouchProbeState probe;
+  //   motor.GetTouchProbe(probe);
+  //   if (probe.positiveEdgeStored) { use(probe.positiveEdgePosition); }
+  // -------------------------------------------------------------------------
+
+  // Enables the probe. Refused with invalid_argument for a combination the
+  // manual rules out (TouchProbe::IsValid()), and - for Trigger::kInput -
+  // when no digital input is mapped to «Touch probe» (0x3142 = 26): armed
+  // anyway, it would wait for an edge that can never come.
+  std::error_code ArmTouchProbe(const controls::TouchProbe & probe);
+
+  // Switches it off, which also clears the edge counters (6.2.141).
+  std::error_code DisarmTouchProbe();
+
+  // Status, both latched positions and both counters, in one call. SDO
+  // reads - these are objects to poll after an event, not per cycle.
+  std::error_code GetTouchProbe(signals::TouchProbeState & out);
 
   // The three that homing depends on, by name. A limit switch that reads as
   // asserted before a homing run started usually means the polarity is

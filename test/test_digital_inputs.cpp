@@ -246,3 +246,43 @@ TEST(HomingMethods, DefaultInputMappingCoversTheCommonMethods)
     EXPECT_TRUE(mapped(*required)) << ToString(method);
   }
 }
+
+
+// Section 6.2.75: 24 and 25 are the limit switches for homing that do not
+// raise a limit error on an ordinary move. Mapping the end stop that way
+// is the right choice when it only serves homing, and must not make Home()
+// refuse the method.
+TEST(HomingInputs, ALimitSwitchCountsInBothForms)
+{
+  using epos4::signals::DigitalInputFunction;
+  using epos4::signals::SatisfiesHomingInput;
+
+  EXPECT_TRUE(
+    SatisfiesHomingInput(
+      DigitalInputFunction::kNegativeLimitSwitch, DigitalInputFunction::kNegativeLimitSwitch));
+  EXPECT_TRUE(
+    SatisfiesHomingInput(
+      DigitalInputFunction::kNegativeLimitSwitchNoError,
+      DigitalInputFunction::kNegativeLimitSwitch));
+  EXPECT_TRUE(
+    SatisfiesHomingInput(
+      DigitalInputFunction::kPositiveLimitSwitchNoError,
+      DigitalInputFunction::kPositiveLimitSwitch));
+}
+
+TEST(HomingInputs, TheWrongSwitchDoesNot)
+{
+  using epos4::signals::DigitalInputFunction;
+  using epos4::signals::SatisfiesHomingInput;
+
+  EXPECT_FALSE(
+    SatisfiesHomingInput(
+      DigitalInputFunction::kPositiveLimitSwitchNoError,
+      DigitalInputFunction::kNegativeLimitSwitch));
+  EXPECT_FALSE(
+    SatisfiesHomingInput(
+      DigitalInputFunction::kHomeSwitch, DigitalInputFunction::kNegativeLimitSwitch));
+  EXPECT_FALSE(
+    SatisfiesHomingInput(
+      DigitalInputFunction::kNegativeLimitSwitchNoError, DigitalInputFunction::kHomeSwitch));
+}

@@ -160,4 +160,53 @@ struct Halt
   static constexpr auto kMode = signals::OperationMode::kNone;
 };
 
+
+// Touch probe 1, sections 6.2.134-142: latches the actual position on an
+// edge, in the drive, to the resolution of the encoder - far finer than
+// anything the master could sample over the bus. For measuring where a
+// sensor switches, or catching the index pulse.
+//
+// Not an operating mode: it runs alongside any of them, except Homing,
+// which cannot be used at the same time and clears every latched value
+// when it completes (6.2.134).
+struct TouchProbe
+{
+  // Touch probe function bits 3..2 (Table 6-164).
+  enum class Trigger : std::uint16_t
+  {
+    kInput = 0b00,        // the digital input mapped to «Touch probe» (0x3142 = 26)
+    kIndexPulse = 0b01,   // the main encoder's index
+    kSourceObject = 0b10, // whatever «Touch probe 1 source» (0x60D0:01) names
+  };
+
+  Trigger trigger{Trigger::kInput};
+  bool continuous{false};    // bit 1: every edge, rather than the first only
+  bool positiveEdge{true};   // bit 4
+  bool negativeEdge{false};  // bit 5
+
+  TouchProbe & WithTrigger(Trigger v) {trigger = v; return *this;}
+  TouchProbe & WithContinuous(bool v) {continuous = v; return *this;}
+  TouchProbe & WithPositiveEdge(bool v) {positiveEdge = v; return *this;}
+  TouchProbe & WithNegativeEdge(bool v) {negativeEdge = v; return *this;}
+
+  // Table 6-164 note [a]: on the index pulse, both edges at once is not
+  // possible. Nor is arming with no edge at all, which would latch nothing.
+  constexpr bool IsValid() const
+  {
+    return (positiveEdge || negativeEdge) &&
+           !(trigger == Trigger::kIndexPulse && positiveEdge && negativeEdge);
+  }
+
+  // The «Touch probe function» word (0x60B8) that enables probe 1 so.
+  constexpr std::uint16_t ToFunctionWord() const
+  {
+    return static_cast<std::uint16_t>(
+      (1u << 0) |                                        // enable touch probe 1
+      (continuous ? 1u << 1 : 0u) |
+      (static_cast<std::uint16_t>(trigger) << 2) |
+      (positiveEdge ? 1u << 4 : 0u) |
+      (negativeEdge ? 1u << 5 : 0u));
+  }
+};
+
 }  // namespace epos4::controls

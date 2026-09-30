@@ -315,6 +315,14 @@ const char * ToString(HomingMethod value);
 // error before anything moves.
 std::optional<DigitalInputFunction> RequiredInput(HomingMethod method);
 
+// Whether an input mapped to `mapped` provides the switch a homing method
+// requires. A limit switch counts in both of its forms: the plain one (0, 1)
+// and the one without limit errors (24, 25), which section 6.2.75 reserves
+// for exactly this - homing against a switch that must not fault the axis
+// on an ordinary move. Checking only the plain code refused homing on a
+// correctly wired arm.
+bool SatisfiesHomingInput(DigitalInputFunction mapped, DigitalInputFunction required);
+
 // True when the method finishes on the encoder index pulse, which needs a
 // 3-channel encoder configured with IndexType::kWithIndex.
 bool RequiresEncoderIndex(HomingMethod method);
