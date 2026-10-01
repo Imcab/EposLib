@@ -21,6 +21,7 @@ using lely_master_t = lely::canopen::AsyncMaster;
 #include "epos4/core/UnitConversion.hpp"
 #include "epos4/signals/Errors.hpp"
 #include "epos4/signals/Identity.hpp"
+#include "epos4/signals/PdoMapping.hpp"
 #include "epos4/signals/StatusSignal.hpp"
 #include "epos4/signals/TouchProbe.hpp"
 
@@ -656,6 +657,26 @@ public:
 
   // Clears the stored history by writing 0 to 0x1003:00.
   std::error_code ClearErrorHistory();
+
+  // -------------------------------------------------------------------------
+  // PDO mapping - inspected, never changed from here (see IsPdoActive()).
+  // -------------------------------------------------------------------------
+
+  // What the drive is configured with: the four RPDOs and four TPDOs, their
+  // COB-IDs, transmission types and mapped objects (6.2.15-6.2.30), over
+  // SDO. signals::Describe() prints it.
+  std::error_code ReadPdoMapping(signals::PdoMapping & out);
+
+  // Compares the drive's mapping with what the master configured at boot -
+  // the concise DCF it holds for this node (0x1F22) - and lists every PDO
+  // object that differs. Empty means both ends agree on every frame's
+  // layout. When they do not, nothing else fails: the master decodes the
+  // drive's frames with its own layout, and reads values that look
+  // plausible and are wrong. Worth calling once after WaitUntilReady().
+  //
+  // no_such_file_or_directory: the network description configures nothing
+  // on this node. bad_message: the master's concise DCF is malformed.
+  std::error_code CheckPdoMapping(std::vector<signals::PdoMismatch> & mismatches);
 
   // Called from the bus thread whenever the drive transmits an emergency
   // frame, without anybody polling. This is how a fault reaches the

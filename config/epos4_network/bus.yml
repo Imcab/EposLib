@@ -84,6 +84,14 @@ node_2:
         - {index: 0x60FF}   # Target velocity      32 bit
         - {index: 0x6071}   # Target torque        16 bit
 
+    # Unused, and switched off on purpose. The drive's defaults leave RPDO3
+    # and RPDO4 valid (Controlword with target position / velocity, on
+    # 0x400/0x500 + node-ID) and dcfgen only touches what is listed here, so
+    # without these lines any other device sending on those IDs would be
+    # commanding this axis. Epos4::CheckPdoMapping() reports such channels.
+    3: {enabled: false}
+    4: {enabled: false}
+
   # --- drive -> master ---
   tpdo:
     1:
@@ -98,3 +106,6 @@ node_2:
       mapping:
         - {index: 0x606C}   # Velocity actual      32 bit
         - {index: 0x6077}   # Torque actual        16 bit
+    # Already disabled by the drive's defaults; stated so the network says so.
+    3: {enabled: false}
+    4: {enabled: false}

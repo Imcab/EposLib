@@ -18,6 +18,21 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Added
 
+- **PDO mapping inspection** (read-only, `signals/PdoMapping.hpp`):
+  `Epos4::ReadPdoMapping()` reads the four RPDOs and four TPDOs - COB-ID,
+  transmission type, inhibit time and mapped objects (6.2.15-6.2.30) - and
+  `signals::Describe()` prints them one line per channel.
+  `Epos4::CheckPdoMapping()` compares them with what the master configured
+  at boot, the concise DCF it holds for the node (0x1F22), and lists every
+  difference. A drive whose mapping differs from the master's raises no
+  error anywhere else - the master decodes its frames with the wrong layout
+  and reads plausible values - so this turns that into an explicit report.
+  It also reports channels valid on the drive that the network description
+  does not configure. `api_demo` runs the check after boot.
+  Verified on vcan0 against `epos4_sim`, including a TPDO remapped behind
+  the master's back (Position demand in place of Position actual: same
+  size, plausible values, caught).
+
 - **`Refresh()` reads back everything `Apply()` can write.** Every
   configuration group now declares its fields once, as a list of field ->
   object (`configs/ConfigFields.hpp`); `Apply()` writes the set fields from
@@ -209,6 +224,11 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Fixed
 
+- `config/epos4_network/bus.yml` disables RPDO3 and RPDO4. The drive's
+  defaults leave them valid (Controlword with target position / velocity on
+  0x400/0x500 + node-ID), and dcfgen only touches the PDOs a network lists,
+  so any other device sending on those IDs would have been commanding the
+  axis. Found by the new mapping check.
 - **Configuration fields of the wrong width or access, each of which aborts
   the SDO on a drive and stops `Apply()` halfway:**
   - «Electrical inductance» (0x3002:02) and «Velocity controller filter

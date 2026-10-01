@@ -105,6 +105,21 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
     bootCount.fetch_add(1, std::memory_order_release);
   }
 
+  // The concise DCF the master downloads to this node at boot - read from
+  // the master's own dictionary, on the bus thread like every access to it.
+  std::error_code ReadConciseDcf(std::vector<std::uint8_t> & out)
+  {
+    std::promise<std::error_code> promise;
+    auto future = promise.get_future();
+    Defer(
+      [this, &out, &promise]() {
+        std::error_code ec;
+        out = master.Read<std::vector<std::uint8_t>>(od::comm::kConciseDcf, id(), ec);
+        promise.set_value(ec);
+      });
+    return future.get();
+  }
+
   // NMT reset communication, to this node only. The node reloads its
   // communication objects and announces itself with a boot-up message, and
   // the master answers that by booting it again - downloading the concise
@@ -1998,6 +2013,55 @@ Epos4::GetErrorHistory(std::vector<std::uint16_t> & out)
     // manufacturer-specific information.
     out.push_back(static_cast<std::uint16_t>(entry & 0xFFFFu));
   }
+  return {};
+}
+
+std::error_code
+Epos4::ReadPdoMapping(signals::PdoMapping & out)
+{
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+  auto & d = *impl_;
+  signals::PdoMapping mapping;
+  for (auto * channels : {&mapping.rpdo, &mapping.tpdo}) {
+    for (auto & c : *channels) {
+      const std::uint16_t param = c.ParameterIndex();
+      if (auto ec = d.Read(od::At(param, 1), c.cobId)) {return ec;}
+      if (auto ec = d.Read(od::At(param, 2), c.transmissionType)) {return ec;}
+      if (c.direction == signals::PdoDirection::kTransmit) {
+        std::uint16_t inhibit{};
+        if (auto ec = d.Read(od::At(param, 3), inhibit)) {return ec;}
+        c.inhibitTime100us = inhibit;
+      }
+      std::uint8_t count{};
+      if (auto ec = d.Read(od::At(c.MappingIndex(), 0), count)) {return ec;}
+      for (std::uint8_t sub = 1; sub <= count; ++sub) {
+        std::uint32_t raw{};
+        if (auto ec = d.Read(od::At(c.MappingIndex(), sub), raw)) {return ec;}
+        c.objects.push_back(signals::PdoObject::Decode(raw));
+      }
+    }
+  }
+  out = std::move(mapping);
+  return {};
+}
+
+std::error_code
+Epos4::CheckPdoMapping(std::vector<signals::PdoMismatch> & mismatches)
+{
+  mismatches.clear();
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
+
+  std::vector<std::uint8_t> bytes;
+  if (auto ec = impl_->ReadConciseDcf(bytes)) {return ec;}
+  // An empty domain: the network description configures nothing on this
+  // node, so there is no expectation to compare against.
+  if (bytes.empty()) {return std::make_error_code(std::errc::no_such_file_or_directory);}
+  const auto concise = signals::ParseConciseDcf(bytes);
+  if (!concise) {return std::make_error_code(std::errc::bad_message);}
+
+  signals::PdoMapping actual;
+  if (auto ec = ReadPdoMapping(actual)) {return ec;}
+  mismatches = signals::CompareWithConciseDcf(*concise, actual);
   return {};
 }
 

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <ros2units/units.h>
 
@@ -51,7 +52,22 @@ main(int argc, char ** argv)
   for (int i = 0; i < 40 && !motor.IsPdoActive(); ++i) {
     std::this_thread::sleep_for(50ms);
   }
-  printf("pdo      : %s\n\n", motor.IsPdoActive() ? "active" : "not mapped (SDO only)");
+  printf("pdo      : %s\n", motor.IsPdoActive() ? "active" : "not mapped (SDO only)");
+
+  // ...and check both ends agree on what each frame carries. If they do not,
+  // nothing else fails: the feedback below would just be wrong.
+  std::vector<epos4::signals::PdoMismatch> mismatches;
+  if (auto ec = motor.CheckPdoMapping(mismatches)) {
+    printf("mapping  : not checked (%s)\n\n", ec.message().c_str());
+  } else if (mismatches.empty()) {
+    printf("mapping  : drive and master agree\n\n");
+  } else {
+    printf("mapping  : %zu DIFFERENCES - fix before trusting any reading\n", mismatches.size());
+    for (const auto & m : mismatches) {
+      printf("  %s\n", epos4::signals::Describe(m).c_str());
+    }
+    printf("\n");
+  }
 
   // ---- configuration ----
   //

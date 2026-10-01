@@ -202,6 +202,10 @@ constexpr std::uint16_t kProgramSoftwareIdentification = 0x1F56;
 constexpr Entry kProgramSoftwareIdentification_ProgramNumber1 = At(0x1F56, 1);  // Program number 1
 constexpr std::uint16_t kFlashStatusIdentification = 0x1F57;
 constexpr Entry kFlashStatusIdentification_ProgramNumber1 = At(0x1F57, 1);  // Program number 1
+// Added by hand: an object of the MASTER's dictionary (CiA 302-3), not the
+// drive's. Sub-index n holds the concise DCF the master downloads to node n
+// at boot; Lely loads it from the UploadFile dcfgen names (node_N.bin).
+constexpr std::uint16_t kConciseDcf = 0x1F22;
 }  // namespace comm
 
 // ---------------------------------------------------------------------------

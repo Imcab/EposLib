@@ -42,6 +42,7 @@ add_library(eposlib_core SHARED
   src/signals/Enums.cpp
   src/signals/Errors.cpp
   src/signals/Identity.cpp
+  src/signals/PdoMapping.cpp
   src/configs/Configs.cpp
   src/configs/EncoderConfigs.cpp
 )
@@ -170,6 +171,14 @@ if(BUILD_TESTING)
   eposlib_add_test(test_cyclic_state eposlib_core)
   eposlib_add_test(test_touch_probe eposlib_core)
   eposlib_add_test(test_capabilities eposlib_core)
+  # Also decodes the concise DCF generated for the example network, when
+  # dcfgen is there to generate it.
+  eposlib_add_test(test_pdo_mapping eposlib_core)
+  target_compile_definitions(test_pdo_mapping PRIVATE
+    EPOSLIB_TEST_NODE_BIN="${CMAKE_CURRENT_BINARY_DIR}/config/epos4_network/node_2.bin")
+  if(TARGET eposlib_dcf_epos4_network)
+    add_dependencies(test_pdo_mapping eposlib_dcf_epos4_network)
+  endif()
   # These two link the device library but open no socket: they exercise
   # what a device allows before CanBus::Start().
   eposlib_add_test(test_encoder_configs eposlib)
