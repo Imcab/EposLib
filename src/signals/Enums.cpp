@@ -87,6 +87,34 @@ ToString(AbortConnectionOption value)
   return "unknown";
 }
 
+bool
+IsPowerDisabled(State state)
+{
+  switch (state) {
+    case State::kNotReadyToSwitchOn:
+    case State::kSwitchOnDisabled:
+    case State::kReadyToSwitchOn:
+    case State::kFault:
+      return true;
+    case State::kSwitchedOn:
+    case State::kOperationEnabled:
+    case State::kQuickStopActive:
+    case State::kFaultReactionActive:
+      return false;
+  }
+  return false;
+}
+
+const char *
+ToString(HaltOption value)
+{
+  switch (value) {
+    case HaltOption::kSlowDownRamp: return "Decelerate with slowdown ramp, stay enabled";
+    case HaltOption::kQuickStopRamp: return "Decelerate with quick stop ramp, stay enabled";
+  }
+  return "unknown";
+}
+
 const char *
 ToString(DigitalInputFunction value)
 {
@@ -315,6 +343,78 @@ ToString(CanBitRate value)
     case CanBitRate::k50kbit: return "50 kbit/s";
     case CanBitRate::k20kbit: return "20 kbit/s";
     case CanBitRate::kAutomatic: return "automatic detection";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(Rs232BitRate value)
+{
+  switch (value) {
+    case Rs232BitRate::k9600: return "9.6 kbit/s";
+    case Rs232BitRate::k14400: return "14.4 kbit/s";
+    case Rs232BitRate::k19200: return "19.2 kbit/s";
+    case Rs232BitRate::k38400: return "38.4 kbit/s";
+    case Rs232BitRate::k57600: return "57.6 kbit/s";
+    case Rs232BitRate::k115200: return "115.2 kbit/s";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(CommunicationErrorBehavior value)
+{
+  switch (value) {
+    case CommunicationErrorBehavior::kEnterPreOperational: return "Enter pre-operational";
+    case CommunicationErrorBehavior::kNoStateChange: return "No change of NMT state";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(AnalogInputFunction value)
+{
+  switch (value) {
+    case AnalogInputFunction::kGeneralPurposeA: return "General purpose A";
+    case AnalogInputFunction::kGeneralPurposeB: return "General purpose B";
+    case AnalogInputFunction::kCurrentSetValue: return "Set value current";
+    case AnalogInputFunction::kVelocitySetValue: return "Set value velocity";
+    case AnalogInputFunction::kNone: return "None";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(AnalogOutputFunction value)
+{
+  switch (value) {
+    case AnalogOutputFunction::kGeneralPurposeA: return "General purpose A";
+    case AnalogOutputFunction::kGeneralPurposeB: return "General purpose B";
+    case AnalogOutputFunction::kNone: return "None";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(StoCardState value)
+{
+  switch (value) {
+    case StoCardState::kPowerDown: return "Power down";
+    case StoCardState::kReleased: return "Released";
+    case StoCardState::kError: return "Error";
+    case StoCardState::kReadyToRelease: return "Ready to release";
+  }
+  return "unknown";
+}
+
+const char *
+ToString(StoCardDetection value)
+{
+  switch (value) {
+    case StoCardDetection::kNotStarted: return "Detection not started";
+    case StoCardDetection::kDummyCard: return "Dummy card detected";
+    case StoCardDetection::kNoCard: return "No card detected";
+    case StoCardDetection::kStoCard: return "STO card detected";
   }
   return "unknown";
 }

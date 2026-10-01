@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <system_error>
 
 #include "epos4/configs/Configs.hpp"
 
@@ -68,9 +69,10 @@ struct SensorsConfigs
   std::optional<Sensor2Type> sensor2;
   std::optional<Sensor3Type> sensor3;
 
-  // Main sensor resolution, 0x3000:05 [quadcounts/revolution]. Read back
-  // after configuring an encoder to confirm the drive agrees with the count
-  // the maths below produces.
+  // Main sensor resolution, 0x3000:05 [quadcounts/revolution]. Read-only:
+  // the drive derives it from the sensor settings, so Apply() never writes
+  // it (a write aborts). Read back after configuring an encoder to confirm
+  // the drive agrees with the count the maths below produces.
   std::optional<std::uint32_t> mainSensorResolution;
 
   // The three slots share one object, so they are written as one word.
@@ -79,7 +81,27 @@ struct SensorsConfigs
   std::uint32_t Encode() const;
   static SensorsConfigs Decode(std::uint32_t value);
 
-  void AppendTo(ConfigWrites & out) const;
+  // The fields and the objects they live in; see ConfigFields.hpp.
+  template<typename Self, typename V>
+  static void Visit(Self & s, V & v)
+  {
+    v.template Composite<std::uint32_t>(
+      od::maxon::kAxisConfiguration_SensorsConfiguration,
+      [&s]() -> std::optional<std::uint32_t> {
+        if (!s.sensor1 && !s.sensor2 && !s.sensor3) {return std::nullopt;}
+        return s.Encode();
+      },
+      [&s](auto word) {
+        const SensorsConfigs d = Decode(word);
+        s.sensor1 = d.sensor1;
+        s.sensor2 = d.sensor2;
+        s.sensor3 = d.sensor3;
+      });
+    v.ReadOnly(od::maxon::kAxisConfiguration_MainSensorResolution, s.mainSensorResolution);
+  }
+
+  void AppendTo(ConfigWrites & out) const {WriteFields(*this, out);}
+  std::error_code ReadFrom(const ConfigReader & read) {return ReadFields(*this, read);}
 };
 
 
@@ -140,7 +162,31 @@ struct DigitalIncrementalEncoderConfigs
 
   std::optional<IncrementalEncoderType> type;  // 0x3010:02
 
-  void AppendTo(ConfigWrites & out) const;
+  // 0x3010:04 / 0x3020:04 [inc], read-only: where the drive last saw the
+  // index pulse. Refresh() reports it; nothing writes it.
+  std::optional<std::int32_t> indexPosition;
+
+  // Encoder 1 lives at 0x3010, encoder 2 at 0x3020; the sub-index layout is
+  // identical, which is why one struct covers both.
+  std::uint16_t Object() const
+  {
+    return encoderNumber == 2 ? od::maxon::kDigitalIncrementalEncoder2 :
+           od::maxon::kDigitalIncrementalEncoder1;
+  }
+
+  // The fields and the objects they live in; see ConfigFields.hpp.
+  template<typename Self, typename V>
+  static void Visit(Self & s, V & v)
+  {
+    v(od::At(s.Object(), 1), s.pulsesPerRevolution);
+    v.template Packed<SelfCodec<IncrementalEncoderType, std::uint16_t>>(
+      od::At(
+        s.Object(), 2), s.type);
+    v.ReadOnly(od::At(s.Object(), 4), s.indexPosition);
+  }
+
+  void AppendTo(ConfigWrites & out) const {WriteFields(*this, out);}
+  std::error_code ReadFrom(const ConfigReader & read) {return ReadFields(*this, read);}
 };
 
 
@@ -148,7 +194,7 @@ struct DigitalIncrementalEncoderConfigs
 // measurement method, and the index is a single bit.
 struct AnalogIncrementalEncoderType
 {
-  bool withIndex{false};
+  bool withIndex{true};  // the drive's default, 0x0001
   EncoderDirection direction{EncoderDirection::kMaxon};
 
   std::uint16_t Encode() const;
@@ -167,7 +213,35 @@ struct AnalogIncrementalEncoderConfigs
   std::optional<std::uint32_t> periodsPerTurn;
   std::optional<std::uint8_t> interpolationBits;
 
-  void AppendTo(ConfigWrites & out) const;
+  // 0x3011:03 [inc], read-only: where the drive last saw the index.
+  std::optional<std::int32_t> indexPosition;
+
+  // The fields and the objects they live in; see ConfigFields.hpp.
+  template<typename Self, typename V>
+  static void Visit(Self & s, V & v)
+  {
+    v.template Packed<SelfCodec<AnalogIncrementalEncoderType, std::uint16_t>>(
+      od::maxon::kAnalogIncrementalEncoder_AnalogIncrementalEncoderType, s.type);
+    // A half-set pair takes the other half from the object's default
+    // 0x00080004 - bits 31..8 are 0x000800 = 2048 periods (Table 6-119),
+    // bits 7..0 are 4 interpolation bits.
+    v.template Composite<std::uint32_t>(
+      od::maxon::kAnalogIncrementalEncoder_AnalogIncrementalEncoderResolution,
+      [&s]() -> std::optional<std::uint32_t> {
+        if (!s.periodsPerTurn && !s.interpolationBits) {return std::nullopt;}
+        return (s.periodsPerTurn.value_or(2048u) << 8) | s.interpolationBits.value_or(4u);
+      },
+      [&s](auto word) {
+        s.periodsPerTurn = word >> 8;
+        s.interpolationBits = static_cast<std::uint8_t>(word & 0xFFu);
+      });
+    v.ReadOnly(
+      od::maxon::kAnalogIncrementalEncoder_AnalogIncrementalEncoderIndexPosition,
+      s.indexPosition);
+  }
+
+  void AppendTo(ConfigWrites & out) const {WriteFields(*this, out);}
+  std::error_code ReadFrom(const ConfigReader & read) {return ReadFields(*this, read);}
 };
 
 
@@ -181,7 +255,7 @@ enum class SsiEncoding : std::uint8_t
 // Object 0x3012:03, Table 6-121.
 struct SsiEncodingType
 {
-  SsiEncoding encoding{SsiEncoding::kBinary};
+  SsiEncoding encoding{SsiEncoding::kGray};  // the drive's default, 0x001
   EncoderDirection direction{EncoderDirection::kMaxon};
   bool checkFrame{false};      // bit 8: frame start and end bit checking
   bool resetReferenceOnFrameError{false};  // bit 9
@@ -210,14 +284,69 @@ struct SsiAbsoluteEncoderConfigs
 
   std::optional<SsiEncodingType> encodingType;  // 0x3012:03
   std::optional<std::uint16_t> timeoutTimeUs;   // 0x3012:05
-  std::optional<std::uint16_t> refreshFrequency;  // 0x3012:07
   std::optional<std::uint16_t> powerUpTimeMs;   // 0x3012:08
+
+  // 0x3012:0A [inc]. Aligns the encoder's zero with the motor's 0 degree
+  // commutation angle, 0..resolution for 0..360 degrees. maxon encoders come
+  // aligned; a third-party one on an EC motor needs it (6.2.58.9).
+  std::optional<std::uint32_t> commutationOffset;
+
+  // 0x3012:0B, Table 6-122: how many of the frame's bits the position uses,
+  // multi-turn in bits 15..8, single-turn in 7..0. The position is 32 bits
+  // at most, so a long multi-turn count has to be cut here. Resolution is
+  // 2^singleTurn inc/rev, and the velocity is computed from it.
+  std::optional<std::uint8_t> positionMultiTurnBits;
+  std::optional<std::uint8_t> positionSingleTurnBits;
+
+  // 0x3012:0E [0.001 ms], -1..1000. Extrapolates the single-turn position
+  // for commutation over the encoder's delay; -1 (default) turns it off.
+  // Documented, but beyond the object's own highest sub-index (13) and not
+  // in the EDS: present only on firmware that has it.
+  std::optional<std::int32_t> additionalDelay;
+
+  // 0x3012:07 [Hz], read-only: how often the drive actually reads the
+  // encoder - the result of the data rate and frame length above.
+  std::optional<std::uint32_t> refreshFrequency;
 
   // The data-bit fields share one object, so they are encoded together.
   // Returns nullopt when none of them were set.
   std::optional<std::uint32_t> EncodeDataBits() const;
+  std::optional<std::uint32_t> EncodePositionBits() const;
 
-  void AppendTo(ConfigWrites & out) const;
+  // The fields and the objects they live in; see ConfigFields.hpp.
+  template<typename Self, typename V>
+  static void Visit(Self & s, V & v)
+  {
+    v(od::maxon::kSSIAbsoluteEncoder_SSIDataRate, s.dataRateKbitPerSecond);
+    v.template Composite<std::uint32_t>(
+      od::maxon::kSSIAbsoluteEncoder_SSINumberOfDataBits,
+      [&s] {return s.EncodeDataBits();},
+      [&s](auto word) {
+        s.specialBitsLeading = static_cast<std::uint8_t>(word >> 24);
+        s.multiTurnBits = static_cast<std::uint8_t>(word >> 16);
+        s.singleTurnBits = static_cast<std::uint8_t>(word >> 8);
+        s.specialBitsTrailing = static_cast<std::uint8_t>(word);
+      });
+    v.template Packed<SelfCodec<SsiEncodingType, std::uint16_t>>(
+      od::maxon::kSSIAbsoluteEncoder_SSIEncodingType, s.encodingType);
+    v(od::maxon::kSSIAbsoluteEncoder_SSITimeoutTime, s.timeoutTimeUs);
+    v(od::maxon::kSSIAbsoluteEncoder_SSIPowerUpTime, s.powerUpTimeMs);
+    v(od::maxon::kSSIAbsoluteEncoder_SSICommutationOffsetValue, s.commutationOffset);
+    v.template Composite<std::uint32_t>(
+      od::maxon::kSSIAbsoluteEncoder_SSIPositionBits,
+      [&s] {return s.EncodePositionBits();},
+      [&s](auto word) {
+        s.positionMultiTurnBits = static_cast<std::uint8_t>(word >> 8);
+        s.positionSingleTurnBits = static_cast<std::uint8_t>(word);
+      });
+    v(
+      od::At(od::maxon::kSSIAbsoluteEncoder, 0x0E), s.additionalDelay,
+      Presence::kFirmwareDependent);
+    v.ReadOnly(od::maxon::kSSIAbsoluteEncoder_SSIRefreshFrequency, s.refreshFrequency);
+  }
+
+  void AppendTo(ConfigWrites & out) const {WriteFields(*this, out);}
+  std::error_code ReadFrom(const ConfigReader & read) {return ReadFields(*this, read);}
 };
 
 
@@ -241,7 +370,16 @@ struct HallSensorConfigs
 {
   std::optional<HallSensorType> type;  // 0x301A:01
 
-  void AppendTo(ConfigWrites & out) const;
+  // The fields and the objects they live in; see ConfigFields.hpp.
+  template<typename Self, typename V>
+  static void Visit(Self & s, V & v)
+  {
+    v.template Packed<SelfCodec<HallSensorType, std::uint16_t>>(
+      od::maxon::kDigitalHallSensor_DigitalHallSensorType, s.type);
+  }
+
+  void AppendTo(ConfigWrites & out) const {WriteFields(*this, out);}
+  std::error_code ReadFrom(const ConfigReader & read) {return ReadFields(*this, read);}
 };
 
 }  // namespace epos4::configs

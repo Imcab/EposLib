@@ -18,6 +18,53 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Added
 
+- **`Refresh()` reads back everything `Apply()` can write.** Every
+  configuration group now declares its fields once, as a list of field ->
+  object (`configs/ConfigFields.hpp`); `Apply()` writes the set fields from
+  that list and `Refresh()` fills every field from it, so a field can no
+  longer be written to one object and read from another, or written and
+  never read. `Configurator::Refresh(Epos4Configuration&)` used to read a
+  dozen fields; it now reads all of them, and every group has its own
+  `Refresh()` beside its `Apply()`, as do the encoder groups on `Encoder`.
+  A refresh keeps going past an object it cannot read and returns the first
+  error; objects only some variants or firmware have
+  (`Presence::kHardwareDependent` / `kFirmwareDependent`) are simply left
+  unset when absent.
+- New configuration groups:
+  - `CommunicationConfigs`: producer and consumer heartbeat (0x1016,
+    0x1017), error behavior (0x1029), USB/RS232 timeouts and RS232 bit
+    rate, CAN bit rate and Node-ID - written last, since they take effect
+    only after save and restart - and the SYNC/EMCY COB-IDs, read-only.
+  - `ProtectionConfigs`: supply under/overvoltage limits (0x2201), written
+    in the order the manual makes always valid, and the power stage
+    temperature limit (0x3201:04, not kept by Save()).
+  - `CustomPersistentMemoryConfigs`: the four application words of 0x210C.
+  - `AnalogInputConfigs` (functions, offset/gain calibration, and the
+    current and velocity set-value lines of 0x3170/0x3171, written before
+    the functions) and `AnalogOutputConfigs`.
+  - `VelocityObserverConfigs` (0x30A3) and `DualLoopConfigs` (0x30AE),
+    whose filter coefficients trigger the update bit of 0x30AE:40 after
+    them; `Validate()` refuses coefficients without `filterActive`, because
+    that same word switches the filter.
+- Fields that were missing from existing groups: gear direction (0x3003:04),
+  the position I gain unit (0x30A1:09), high-speed digital output 2
+  (0x3151:04, Disk 60/8 and 60/12), the halt option (0x605D, firmware
+  0x0180+), SSI commutation offset, position bits and additional delay
+  (0x3012:0A, :0B, :0E), and, read-only, the encoders' index positions and
+  the SSI refresh frequency.
+- `Epos4Configuration::Validate()`, run by `Configurator::Apply()` before
+  the first write: input mappings (digital and analog) and the dual loop
+  filter.
+- `MotorConfigs::ratedTorque` reads back «Motor rated torque» (0x6076), the
+  value every torque object is a per mille of; read-only, since the drive
+  computes it.
+- Status signals: `GetMotorI2tPercent()` and `GetPowerStageI2tPercent()`
+  (0x3200), `GetPwmDutyCyclePerMille()` (0x3203), `GetStoInputs()` and
+  `GetStoCardStatus()` (0x3202).
+- `test_config_types` checks the data type and access of every
+  configuration field against the maxon EDS in `config/epos4_network`, so a
+  field of the wrong width fails CI instead of a drive.
+
 - More feedback: `GetTorqueAveraged()` and `GetVelocityAveraged()`
   (0x30D2, 0x30D3), and per-sensor position and velocity on the encoder
   subsystem - `GetSensorPosition()`, `GetSensorVelocity()`,
@@ -161,6 +208,43 @@ Communication Guide, edition 2026-04, rel13604**.
   keeps the CANopen network description, which the library needs.
 
 ### Fixed
+
+- **Configuration fields of the wrong width or access, each of which aborts
+  the SDO on a drive and stops `Apply()` halfway:**
+  - «Electrical inductance» (0x3002:02) and «Velocity controller filter
+    cut-off frequency» (0x30A2:05) are UNSIGNED16; they were written as 32
+    bits.
+  - «Main sensor resolution» and «Max system speed» (0x3000:05/06) are
+    read-only; `AxisConfigs` and `SensorsConfigs` wrote them. They are now
+    read back only.
+  - «SSI refresh frequency» (0x3012:07) is read-only UNSIGNED32; it was
+    written as 16 bits.
+  - «Following error time out» (0x6066) accepts only 0 (6.2.106); it is
+    now read back only.
+  Found by reading the whole configuration from `epos4_sim` (which enforces
+  the real EDS) and writing it back.
+- **`Configurator::Apply()` wrote objects the manual only allows in «Power
+  Disable»** - axis configuration, pole pairs, gear (except its max input
+  speed), SI units and encoders - whatever the drive state, so applying one
+  to an enabled drive aborted it partway. Such an Apply now returns
+  `operation_not_permitted` before the first write while power is on, as
+  `Encoder::Apply()` already did; `RestoreDefaults()` too (6.2.7). The rule
+  lives in `configs::RequiresPowerDisabled()` and
+  `signals::IsPowerDisabled()`.
+- A half-set SinCos resolution (only `periodsPerTurn` or only
+  `interpolationBits`) filled the other half with 8 periods; the default of
+  0x3011:02 is 0x00080004, which is **2048** periods (Table 6-119). The
+  resolution came out 256 times too coarse.
+- `DigitalInputConfigs::Validate()` refuses touch probe on high-speed inputs
+  1 and 3, which Table 6-131 excludes.
+- `AnalogIncrementalEncoderType` and `SsiEncodingType` default to the
+  drive's own defaults (with index; Gray code), like
+  `IncrementalEncoderType` already did, so a partly filled type means what
+  the drive would assume.
+- Section numbers cited in comments that pointed at the wrong object.
+- `Configurator::Apply(Epos4Configuration)` now validates the digital input
+  mapping, as the per-group `Apply()` always did.
+- «Electrical resistance» (0x3002:01) is documented in mOhm, not uOhm.
 
 - **`Home()` could report a run attained that had not started, and a
   second PPM move could be taken as accepted without the drive seeing

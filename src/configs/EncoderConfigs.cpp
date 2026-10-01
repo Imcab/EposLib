@@ -31,19 +31,6 @@ SensorsConfigs::Decode(std::uint32_t value)
   return out;
 }
 
-void
-SensorsConfigs::AppendTo(ConfigWrites & out) const
-{
-  if (sensor1 || sensor2 || sensor3) {
-    out.push_back(
-      ConfigWrite{od::maxon::kAxisConfiguration_SensorsConfiguration, Encode()});
-  }
-  if (mainSensorResolution) {
-    out.push_back(
-      ConfigWrite{od::maxon::kAxisConfiguration_MainSensorResolution, *mainSensorResolution});
-  }
-}
-
 
 // --- Digital incremental encoder type, 0x3010:02, Table 6-117 --------------
 
@@ -68,23 +55,6 @@ IncrementalEncoderType::Decode(std::uint16_t value)
   return out;
 }
 
-void
-DigitalIncrementalEncoderConfigs::AppendTo(ConfigWrites & out) const
-{
-  // Encoder 1 lives at 0x3010, encoder 2 at 0x3020; the sub-index layout is
-  // identical, which is why one struct covers both.
-  const std::uint16_t base =
-    (encoderNumber == 2) ? od::maxon::kDigitalIncrementalEncoder2 :
-    od::maxon::kDigitalIncrementalEncoder1;
-
-  if (pulsesPerRevolution) {
-    out.push_back(ConfigWrite{od::At(base, 1), *pulsesPerRevolution});
-  }
-  if (type) {
-    out.push_back(ConfigWrite{od::At(base, 2), type->Encode()});
-  }
-}
-
 
 // --- Analog incremental encoder, 0x3011, Table 6-118 -----------------------
 
@@ -106,28 +76,20 @@ AnalogIncrementalEncoderType::Decode(std::uint16_t value)
   return out;
 }
 
-void
-AnalogIncrementalEncoderConfigs::AppendTo(ConfigWrites & out) const
+
+// --- SSI absolute encoder, 0x3012, Tables 6-120 to 6-122 ------------------
+
+std::optional<std::uint32_t>
+SsiAbsoluteEncoderConfigs::EncodePositionBits() const
 {
-  if (type) {
-    out.push_back(
-      ConfigWrite{od::maxon::kAnalogIncrementalEncoder_AnalogIncrementalEncoderType,
-        type->Encode()});
+  if (!positionMultiTurnBits && !positionSingleTurnBits) {
+    return std::nullopt;
   }
-  if (periodsPerTurn || interpolationBits) {
-    // Bits 31..8 periods per turn, bits 7..0 interpolation bits. Defaults
-    // taken from the object's own default value 0x00080004: 8 periods,
-    // 4 interpolation bits.
-    const std::uint32_t periods = periodsPerTurn.value_or(8u);
-    const std::uint32_t bits = interpolationBits.value_or(4u);
-    out.push_back(
-      ConfigWrite{od::maxon::kAnalogIncrementalEncoder_AnalogIncrementalEncoderResolution,
-        static_cast<std::uint32_t>((periods << 8) | (bits & 0xFFu))});
-  }
+  // Defaults from the object's own default 0x0000000C: 12 single-turn bits.
+  const std::uint32_t multi = positionMultiTurnBits.value_or(0u);
+  const std::uint32_t single = positionSingleTurnBits.value_or(12u);
+  return (multi << 8) | single;
 }
-
-
-// --- SSI absolute encoder, 0x3012, Tables 6-120 and 6-121 ------------------
 
 std::uint16_t
 SsiEncodingType::Encode() const
@@ -167,35 +129,6 @@ SsiAbsoluteEncoderConfigs::EncodeDataBits() const
   return (leading << 24) | (multi << 16) | (single << 8) | trailing;
 }
 
-void
-SsiAbsoluteEncoderConfigs::AppendTo(ConfigWrites & out) const
-{
-  if (dataRateKbitPerSecond) {
-    out.push_back(
-      ConfigWrite{od::maxon::kSSIAbsoluteEncoder_SSIDataRate, *dataRateKbitPerSecond});
-  }
-  if (const auto bits = EncodeDataBits()) {
-    out.push_back(
-      ConfigWrite{od::maxon::kSSIAbsoluteEncoder_SSINumberOfDataBits, *bits});
-  }
-  if (encodingType) {
-    out.push_back(
-      ConfigWrite{od::maxon::kSSIAbsoluteEncoder_SSIEncodingType, encodingType->Encode()});
-  }
-  if (timeoutTimeUs) {
-    out.push_back(
-      ConfigWrite{od::maxon::kSSIAbsoluteEncoder_SSITimeoutTime, *timeoutTimeUs});
-  }
-  if (refreshFrequency) {
-    out.push_back(
-      ConfigWrite{od::maxon::kSSIAbsoluteEncoder_SSIRefreshFrequency, *refreshFrequency});
-  }
-  if (powerUpTimeMs) {
-    out.push_back(
-      ConfigWrite{od::maxon::kSSIAbsoluteEncoder_SSIPowerUpTime, *powerUpTimeMs});
-  }
-}
-
 
 // --- Digital Hall sensor, 0x301A, Table 6-123 ------------------------------
 
@@ -219,13 +152,5 @@ HallSensorType::Decode(std::uint16_t value)
   return out;
 }
 
-void
-HallSensorConfigs::AppendTo(ConfigWrites & out) const
-{
-  if (type) {
-    out.push_back(
-      ConfigWrite{od::maxon::kDigitalHallSensor_DigitalHallSensorType, type->Encode()});
-  }
-}
 
 }  // namespace epos4::configs

@@ -1,6 +1,7 @@
 #include "epos4/hardware/Encoder.hpp"
 
 #include <utility>
+#include <variant>
 
 #include "epos4/hardware/Epos4.hpp"
 
@@ -9,27 +10,6 @@ namespace epos4
 
 namespace
 {
-
-// The manual repeats this for every encoder type word: "Write access is only
-// permitted in device state «Power Disable»". These are the CiA 402 states in
-// which no power reaches the motor.
-bool
-IsPowerDisabled(signals::State state)
-{
-  switch (state) {
-    case signals::State::kNotReadyToSwitchOn:
-    case signals::State::kSwitchOnDisabled:
-    case signals::State::kReadyToSwitchOn:
-    case signals::State::kFault:
-      return true;
-    case signals::State::kSwitchedOn:
-    case signals::State::kOperationEnabled:
-    case signals::State::kQuickStopActive:
-    case signals::State::kFaultReactionActive:
-      return false;
-  }
-  return false;
-}
 
 }  // namespace
 
@@ -88,7 +68,7 @@ Encoder::ApplyWhilePowerDisabled(const configs::ConfigWrites & writes)
   if (state.GetStatus()) {
     return state.GetStatus();
   }
-  if (!IsPowerDisabled(state.GetValue())) {
+  if (!signals::IsPowerDisabled(state.GetValue())) {
     // Refuse up front rather than letting the drive abort each write with
     // "Wrong device state error" (0x08000022) one at a time, which would
     // leave the configuration half applied.
@@ -105,12 +85,25 @@ Encoder::ApplyWhilePowerDisabled(const configs::ConfigWrites & writes)
   return {};
 }
 
+configs::ConfigReader
+Encoder::Reader()
+{
+  return [this](od::Entry entry, configs::ConfigValue & value) {
+           return std::visit([&](auto & typed) {return device_.ReadObject(entry, typed);}, value);
+         };
+}
+
+// Reading needs no power state: only the writes are restricted.
 #define EPOS4_ENCODER_APPLY(Type) \
   std::error_code Encoder::Apply(const configs::Type & config) \
   { \
     configs::ConfigWrites writes; \
     config.AppendTo(writes); \
     return ApplyWhilePowerDisabled(writes); \
+  } \
+  std::error_code Encoder::Refresh(configs::Type & config) \
+  { \
+    return config.ReadFrom(Reader()); \
   }
 
 EPOS4_ENCODER_APPLY(SensorsConfigs)
@@ -124,19 +117,7 @@ EPOS4_ENCODER_APPLY(HallSensorConfigs)
 std::error_code
 Encoder::ReadSensorsConfiguration(configs::SensorsConfigs & out)
 {
-  std::uint32_t raw{};
-  if (auto ec = device_.ReadObject(
-      od::maxon::kAxisConfiguration_SensorsConfiguration, raw))
-  {
-    return ec;
-  }
-  out = configs::SensorsConfigs::Decode(raw);
-
-  std::uint32_t resolution{};
-  if (!device_.ReadObject(od::maxon::kAxisConfiguration_MainSensorResolution, resolution)) {
-    out.mainSensorResolution = resolution;
-  }
-  return {};
+  return Refresh(out);
 }
 
 signals::StatusSignal<std::int32_t> &

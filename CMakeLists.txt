@@ -158,6 +158,11 @@ if(BUILD_TESTING)
   eposlib_add_test(test_cia402_state_machine eposlib_core)
   eposlib_add_test(test_errors eposlib_core)
   eposlib_add_test(test_configs eposlib_core)
+  eposlib_add_test(test_config_readback eposlib_core)
+  # Checks every configuration field against the maxon EDS in the repo.
+  eposlib_add_test(test_config_types eposlib_core)
+  target_compile_definitions(test_config_types PRIVATE
+    EPOSLIB_TEST_EDS="${CMAKE_CURRENT_SOURCE_DIR}/config/epos4_network/epos4.eds")
   eposlib_add_test(test_unit_conversion eposlib_core)
   eposlib_add_test(test_digital_inputs eposlib_core)
   eposlib_add_test(test_status_signal eposlib_core)

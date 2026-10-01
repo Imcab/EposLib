@@ -599,6 +599,12 @@ constexpr std::uint16_t kQuickStopOptionCode = 0x605A;
 constexpr std::uint16_t kShutdownOptionCode = 0x605B;
 constexpr std::uint16_t kDisableOperationOptionCode = 0x605C;
 constexpr std::uint16_t kFaultReactionOptionCode = 0x605E;
+// Added by hand: firmware 0x0180 introduced these (chapter 8, "for SPS
+// homing function-block compatibility"), so EDS files for older firmware -
+// the one this table was generated from - do not list them. 0x607C holds the
+// same value as maxon's «Home position» 0x30B0, which every firmware has.
+constexpr std::uint16_t kHaltOptionCode = 0x605D;
+constexpr std::uint16_t kHomeOffset = 0x607C;
 constexpr std::uint16_t kModesOfOperation = 0x6060;
 constexpr std::uint16_t kModesOfOperationDisplay = 0x6061;
 constexpr std::uint16_t kPositionDemandValue = 0x6062;

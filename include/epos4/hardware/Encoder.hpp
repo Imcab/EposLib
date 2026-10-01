@@ -65,7 +65,17 @@ public:
   std::error_code Apply(const configs::SsiAbsoluteEncoderConfigs & config);
   std::error_code Apply(const configs::HallSensorConfigs & config);
 
-  // Reads 0x3000:01 back and decodes it into the slot types.
+  // Each group read back from the drive - every field Apply() can write,
+  // plus the read-only values the drive derives (resolution, index
+  // position, SSI refresh rate). Allowed in any power state. For the
+  // digital encoder, set encoderNumber first: it picks the object.
+  std::error_code Refresh(configs::SensorsConfigs & config);
+  std::error_code Refresh(configs::DigitalIncrementalEncoderConfigs & config);
+  std::error_code Refresh(configs::AnalogIncrementalEncoderConfigs & config);
+  std::error_code Refresh(configs::SsiAbsoluteEncoderConfigs & config);
+  std::error_code Refresh(configs::HallSensorConfigs & config);
+
+  // The same as Refresh(SensorsConfigs&); kept from before Refresh existed.
   std::error_code ReadSensorsConfiguration(configs::SensorsConfigs & out);
 
   // -------------------------------------------------------------------------
@@ -171,6 +181,7 @@ public:
 
 private:
   std::error_code ApplyWhilePowerDisabled(const configs::ConfigWrites & writes);
+  configs::ConfigReader Reader();
 
   Epos4 & device_;
 

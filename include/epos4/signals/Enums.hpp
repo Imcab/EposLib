@@ -28,6 +28,12 @@ enum class State : std::uint16_t
 
 const char * ToString(State value);
 
+// The manual's «Power Disable»: the states in which no power reaches the
+// motor, and the only ones in which the axis, gear, SI unit and encoder
+// objects may be written (6.2.52-6.2.60, 6.2.128-130). Fault counts: the
+// power stage is off. Fault reaction active does not: it is still braking.
+bool IsPowerDisabled(State state);
+
 
 // ---------------------------------------------------------------------------
 // Operating mode, object 0x6060 / 0x6061, Table 6-154 (p.6-220).
@@ -414,6 +420,18 @@ enum class AbortConnectionOption : std::int16_t
 const char * ToString(AbortConnectionOption value);
 
 
+// Halt option code, 0x605D, Table 6-152: what bit 8 of the controlword does
+// in the profile modes. Firmware 0x0180 and later; older firmware halts on
+// the profile deceleration, which is what kSlowDownRamp keeps.
+enum class HaltOption : std::int16_t
+{
+  kSlowDownRamp = 1,  // decelerate on the profile deceleration, stay enabled
+  kQuickStopRamp = 2  // decelerate on the quick stop deceleration, stay enabled
+};
+
+const char * ToString(HaltOption value);
+
+
 // «Supported drive modes» (0x6502, section 6.2.151) is a CiA 402 bit field:
 // bit (mode - 1) set means the drive implements that mode. The EPOS4's
 // 0x000003A5 is the six this library drives: PPM, PVM, HMM, CSP, CSV, CST.
@@ -451,6 +469,95 @@ enum class CanBitRate : std::uint8_t
 };
 
 const char * ToString(CanBitRate value);
+
+
+// RS232 bit rate, 0x2002, Table 6-95. Takes effect after save and restart.
+enum class Rs232BitRate : std::uint8_t
+{
+  k9600 = 0,
+  k14400 = 1,
+  k19200 = 2,
+  k38400 = 3,
+  k57600 = 4,
+  k115200 = 5,  // device default
+};
+
+const char * ToString(Rs232BitRate value);
+
+
+// Error behavior, 0x1029:01 (6.2.12): what the drive's NMT state does when it
+// loses a heartbeat it consumes. What the axis does is a separate choice -
+// the abort connection option, 0x6007.
+enum class CommunicationErrorBehavior : std::uint8_t
+{
+  kEnterPreOperational = 0,  // device default; only from «Operational»
+  kNoStateChange = 1,
+};
+
+const char * ToString(CommunicationErrorBehavior value);
+
+
+// Analog input functions, 0x3161, Table 6-138. Each function may be mapped
+// to one input only.
+enum class AnalogInputFunction : std::uint8_t
+{
+  kGeneralPurposeA = 0,   // value readable at 0x3162:01
+  kGeneralPurposeB = 1,   // value readable at 0x3162:02
+  kCurrentSetValue = 8,   // the input commands current, scaled by 0x3170
+  kVelocitySetValue = 9,  // the input commands velocity, scaled by 0x3171
+  kNone = 255,
+};
+
+const char * ToString(AnalogInputFunction value);
+
+
+// Analog output functions, 0x3181, Table 6-140.
+enum class AnalogOutputFunction : std::uint8_t
+{
+  kGeneralPurposeA = 0,  // driven by the host through 0x3182:01
+  kGeneralPurposeB = 1,  // driven by the host through 0x3182:02
+  kNone = 255,
+};
+
+const char * ToString(AnalogOutputFunction value);
+
+
+// Safe Torque Off, 0x3202 (6.2.90). Not on the Disk and Micro variants. The
+// manual only reports the inputs; what each state means for the power stage
+// is in the separate «EPOS4 Application Notes», so this stays a plain
+// report of the two inputs rather than a guessed "torque allowed" flag.
+struct StoInputStates
+{
+  bool input1Active{false};  // 0x3202:01 bit 0
+  bool input2Active{false};  // 0x3202:01 bit 1
+};
+
+// The STO card of the Module/Compact 60/20, 0x3202:02, Tables 6-143..6-145.
+enum class StoCardState : std::uint8_t
+{
+  kPowerDown = 0,
+  kReleased = 1,
+  kError = 2,
+  kReadyToRelease = 3,
+};
+
+const char * ToString(StoCardState value);
+
+enum class StoCardDetection : std::uint8_t
+{
+  kNotStarted = 0,
+  kDummyCard = 1,
+  kNoCard = 2,
+  kStoCard = 3,
+};
+
+const char * ToString(StoCardDetection value);
+
+struct StoCardStatus
+{
+  StoCardState state{StoCardState::kPowerDown};             // bits 5..4
+  StoCardDetection detection{StoCardDetection::kNotStarted};  // bits 1..0
+};
 
 
 // The analog channels, by their subindex in 0x3160 (input voltage), 0x3180

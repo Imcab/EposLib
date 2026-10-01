@@ -1,5 +1,6 @@
 #include "epos4/hardware/Epos4.hpp"
 
+#include <algorithm>
 #include <lely/coapp/loop_driver.hpp>
 #include <lely/coapp/sdo_error.hpp>
 
@@ -506,6 +507,11 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   signals::StatusSignal<units::voltage::volt_t> supplyVoltage;
   signals::StatusSignal<units::temperature::celsius_t> powerStageTemperature;
   signals::StatusSignal<units::temperature::celsius_t> powerStageTemperatureLimit;
+  signals::StatusSignal<std::uint16_t> motorI2t;
+  signals::StatusSignal<std::uint16_t> powerStageI2t;
+  signals::StatusSignal<std::uint16_t> pwmDutyCycle;
+  signals::StatusSignal<signals::StoInputStates> stoInputs;
+  signals::StatusSignal<signals::StoCardStatus> stoCardStatus;
 
 
   // Guarded because it is set from the application thread and read from the
@@ -555,6 +561,14 @@ Configurator::Configurator(Epos4 & device)
 std::error_code
 Configurator::ApplyWrites(const configs::ConfigWrites & writes)
 {
+  const bool needsPowerOff = std::any_of(
+    writes.begin(), writes.end(),
+    [](const configs::ConfigWrite & w) {return configs::RequiresPowerDisabled(w.entry);});
+  if (needsPowerOff) {
+    if (auto ec = RequirePowerDisabled()) {
+      return ec;
+    }
+  }
   for (const auto & w : writes) {
     const std::error_code ec = std::visit(
       [&](auto value) {
@@ -571,33 +585,95 @@ Configurator::ApplyWrites(const configs::ConfigWrites & writes)
 std::error_code
 Configurator::Apply(const configs::Epos4Configuration & config)
 {
+  if (auto ec = config.Validate()) {
+    return ec;
+  }
   return ApplyWrites(config.ToWrites());
 }
 
-#define EPOS4_APPLY_GROUP(Type) \
+configs::ConfigReader
+Configurator::Reader()
+{
+  auto & d = *device_.impl_;
+  return [&d](od::Entry entry, configs::ConfigValue & value) {
+           return std::visit([&](auto & typed) {return d.Read(entry, typed);}, value);
+         };
+}
+
+#define EPOS4_CONFIG_GROUP(Type) \
   std::error_code Configurator::Apply(const configs::Type & config) \
   { \
     configs::ConfigWrites writes; \
     config.AppendTo(writes); \
     return ApplyWrites(writes); \
+  } \
+  std::error_code Configurator::Refresh(configs::Type & config) \
+  { \
+    return config.ReadFrom(Reader()); \
   }
 
-EPOS4_APPLY_GROUP(MotorConfigs)
-EPOS4_APPLY_GROUP(GearConfigs)
-EPOS4_APPLY_GROUP(AxisConfigs)
-EPOS4_APPLY_GROUP(CurrentControlConfigs)
-EPOS4_APPLY_GROUP(PositionControlConfigs)
-EPOS4_APPLY_GROUP(VelocityControlConfigs)
-EPOS4_APPLY_GROUP(MotionProfileConfigs)
-EPOS4_APPLY_GROUP(LimitConfigs)
-EPOS4_APPLY_GROUP(HomingConfigs)
-EPOS4_APPLY_GROUP(StopOptionConfigs)
-EPOS4_APPLY_GROUP(HoldingBrakeConfigs)
-EPOS4_APPLY_GROUP(StandstillConfigs)
-EPOS4_APPLY_GROUP(DigitalOutputConfigs)
-EPOS4_APPLY_GROUP(CyclicConfigs)
+EPOS4_CONFIG_GROUP(MotorConfigs)
+EPOS4_CONFIG_GROUP(GearConfigs)
+EPOS4_CONFIG_GROUP(AxisConfigs)
+EPOS4_CONFIG_GROUP(CurrentControlConfigs)
+EPOS4_CONFIG_GROUP(PositionControlConfigs)
+EPOS4_CONFIG_GROUP(VelocityControlConfigs)
+EPOS4_CONFIG_GROUP(VelocityObserverConfigs)
+EPOS4_CONFIG_GROUP(MotionProfileConfigs)
+EPOS4_CONFIG_GROUP(LimitConfigs)
+EPOS4_CONFIG_GROUP(HomingConfigs)
+EPOS4_CONFIG_GROUP(StopOptionConfigs)
+EPOS4_CONFIG_GROUP(HoldingBrakeConfigs)
+EPOS4_CONFIG_GROUP(StandstillConfigs)
+EPOS4_CONFIG_GROUP(DigitalOutputConfigs)
+EPOS4_CONFIG_GROUP(CyclicConfigs)
+EPOS4_CONFIG_GROUP(SiUnitConfigs)
+EPOS4_CONFIG_GROUP(AnalogOutputConfigs)
+EPOS4_CONFIG_GROUP(ProtectionConfigs)
+EPOS4_CONFIG_GROUP(CustomPersistentMemoryConfigs)
+EPOS4_CONFIG_GROUP(CommunicationConfigs)
 
-#undef EPOS4_APPLY_GROUP
+#undef EPOS4_CONFIG_GROUP
+
+std::error_code
+Configurator::Refresh(configs::DigitalInputConfigs & config)
+{
+  return config.ReadFrom(Reader());
+}
+
+std::error_code
+Configurator::Apply(const configs::AnalogInputConfigs & config)
+{
+  if (auto ec = config.Validate()) {
+    return ec;
+  }
+  configs::ConfigWrites writes;
+  config.AppendTo(writes);
+  return ApplyWrites(writes);
+}
+
+std::error_code
+Configurator::Refresh(configs::AnalogInputConfigs & config)
+{
+  return config.ReadFrom(Reader());
+}
+
+std::error_code
+Configurator::Apply(const configs::DualLoopConfigs & config)
+{
+  if (auto ec = config.Validate()) {
+    return ec;
+  }
+  configs::ConfigWrites writes;
+  config.AppendTo(writes);
+  return ApplyWrites(writes);
+}
+
+std::error_code
+Configurator::Refresh(configs::DualLoopConfigs & config)
+{
+  return config.ReadFrom(Reader());
+}
 
 std::error_code
 Configurator::Apply(const configs::DigitalInputConfigs & config)
@@ -613,6 +689,18 @@ Configurator::Apply(const configs::DigitalInputConfigs & config)
 }
 
 std::error_code
+Configurator::RequirePowerDisabled()
+{
+  auto & state = device_.GetState();
+  state.Refresh();
+  if (state.GetStatus()) {
+    return state.GetStatus();
+  }
+  return signals::IsPowerDisabled(state.GetValue()) ?
+         std::error_code{} : std::make_error_code(std::errc::operation_not_permitted);
+}
+
+std::error_code
 Configurator::Save()
 {
   // 0x1010:01, signature "save" as little-endian ASCII. Section 6.2.6.
@@ -625,7 +713,13 @@ Configurator::Save()
 std::error_code
 Configurator::RestoreDefaults()
 {
-  // 0x1011:01, signature "load". Section 6.2.7. Takes effect after a reset.
+  // 0x1011:01, signature "load". Section 6.2.7. Takes effect after a reset,
+  // and is "permitted in NMT state «Pre-Operational» and device state «Power
+  // Disable», only". The power state is checked here; the NMT state is the
+  // caller's (the drive aborts the write in «Operational»).
+  if (auto ec = RequirePowerDisabled()) {
+    return ec;
+  }
   constexpr std::uint32_t kLoadSignature = 0x64616F6C;  // 'l','o','a','d'
   return device_.impl_->Write<std::uint32_t>(
     od::comm::kRestoreDefaultParameters_RestoreAllDefaultParameters, kLoadSignature);
@@ -634,60 +728,7 @@ Configurator::RestoreDefaults()
 std::error_code
 Configurator::Refresh(configs::Epos4Configuration & config)
 {
-  auto & impl = *device_.impl_;
-  std::uint32_t u32{};
-  std::uint16_t u16{};
-  std::uint8_t u8{};
-  std::int32_t i32{};
-
-  auto ec = impl.Read<std::uint16_t>(od::At(od::cia402::kMotorType), u16);
-  if (ec) {return ec;}
-  config.motor.motorType = static_cast<signals::MotorType>(u16);
-
-  if (!(ec = impl.Read(od::maxon::kMotorData_NominalCurrent, u32))) {
-    config.motor.nominalCurrent = u32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::maxon::kMotorData_OutputCurrentLimit, u32))) {
-    config.motor.outputCurrentLimit = u32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::maxon::kMotorData_NumberOfPolePairs, u8))) {
-    config.motor.numberOfPolePairs = u8;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::maxon::kMotorData_TorqueConstant, u32))) {
-    config.motor.torqueConstant = u32;
-  } else {return ec;}
-
-  if (!(ec = impl.Read(od::maxon::kPositionControlParameterSet_PositionControllerPGain, u32))) {
-    config.positionControl.p = u32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::maxon::kPositionControlParameterSet_PositionControllerIGain, u32))) {
-    config.positionControl.i = u32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::maxon::kPositionControlParameterSet_PositionControllerDGain, u32))) {
-    config.positionControl.d = u32;
-  } else {return ec;}
-
-  if (!(ec = impl.Read(od::At(od::cia402::kProfileVelocity), u32))) {
-    config.motionProfile.profileVelocity = u32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::At(od::cia402::kProfileAcceleration), u32))) {
-    config.motionProfile.profileAcceleration = u32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::At(od::cia402::kProfileDeceleration), u32))) {
-    config.motionProfile.profileDeceleration = u32;
-  } else {return ec;}
-
-  if (!(ec = impl.Read(od::cia402::kSoftwarePositionLimit_MinPositionLimit, i32))) {
-    config.limits.minPositionLimit = i32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::cia402::kSoftwarePositionLimit_MaxPositionLimit, i32))) {
-    config.limits.maxPositionLimit = i32;
-  } else {return ec;}
-  if (!(ec = impl.Read(od::At(od::cia402::kMaxMotorSpeed), u32))) {
-    config.limits.maxMotorSpeed = u32;
-  } else {return ec;}
-
-  return {};
+  return config.ReadFrom(Reader());
 }
 
 }  // namespace epos4
@@ -865,6 +906,34 @@ Epos4::Attach(lely_master_t & master)
       auto ec = d.Read<std::uint16_t>(
         od::maxon::kThermalOverloadProtection_MaximalTemperaturePowerStage, decidegrees);
       if (!ec) {out = ToTemperature(static_cast<std::int16_t>(decidegrees));}
+      return ec;
+    });
+
+  auto u16 = [&d](od::Entry entry) {
+      return [&d, entry](std::uint16_t & out) {return d.ReadPreferPdo<std::uint16_t>(entry, out);};
+    };
+  d.motorI2t = signals::StatusSignal<std::uint16_t>(u16(od::maxon::kPowerLimitation_I2tLevelMotor));
+  d.powerStageI2t = signals::StatusSignal<std::uint16_t>(
+    u16(od::maxon::kPowerLimitation_I2tLevelPowerStage));
+  d.pwmDutyCycle = signals::StatusSignal<std::uint16_t>(
+    u16(od::maxon::kMotorControl_PWMDutyCycleActualValue));
+  d.stoInputs = signals::StatusSignal<signals::StoInputStates>(
+    [&d](signals::StoInputStates & out) {
+      std::uint8_t raw{};
+      auto ec = d.Read(od::maxon::kFunctionalSafety_STOInputStates, raw);
+      if (!ec) {out = {(raw & 0x01u) != 0u, (raw & 0x02u) != 0u};}
+      return ec;
+    });
+  d.stoCardStatus = signals::StatusSignal<signals::StoCardStatus>(
+    [&d](signals::StoCardStatus & out) {
+      // Sub-index 2 exists only on the 60/20, so it is not in the generated
+      // table (built from a 50/15 EDS).
+      std::uint8_t raw{};
+      auto ec = d.Read(od::At(od::maxon::kFunctionalSafety, 2), raw);
+      if (!ec) {
+        out.state = static_cast<signals::StoCardState>((raw >> 4) & 0x3u);
+        out.detection = static_cast<signals::StoCardDetection>(raw & 0x3u);
+      }
       return ec;
     });
 
@@ -1584,6 +1653,20 @@ signals::StatusSignal<units::temperature::celsius_t> & Epos4::GetPowerStageTempe
 signals::StatusSignal<units::temperature::celsius_t> & Epos4::GetPowerStageTemperatureLimit()
 {
   return impl_->powerStageTemperatureLimit;
+}
+signals::StatusSignal<std::uint16_t> & Epos4::GetMotorI2tPercent() {return impl_->motorI2t;}
+signals::StatusSignal<std::uint16_t> & Epos4::GetPowerStageI2tPercent()
+{
+  return impl_->powerStageI2t;
+}
+signals::StatusSignal<std::uint16_t> & Epos4::GetPwmDutyCyclePerMille()
+{
+  return impl_->pwmDutyCycle;
+}
+signals::StatusSignal<signals::StoInputStates> & Epos4::GetStoInputs() {return impl_->stoInputs;}
+signals::StatusSignal<signals::StoCardStatus> & Epos4::GetStoCardStatus()
+{
+  return impl_->stoCardStatus;
 }
 signals::StatusSignal<std::int16_t> & Epos4::GetTorqueAveraged() {return impl_->torqueAveraged;}
 signals::StatusSignal<std::int32_t> & Epos4::GetVelocityAveraged() {return impl_->velocityAveraged;}

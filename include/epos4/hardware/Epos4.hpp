@@ -45,41 +45,79 @@ public:
 
   // Writes every field that was explicitly set. Fields left unset are not
   // touched, so a partially filled configuration will not wipe tuned gains.
+  // Validates the input mappings first and writes nothing if they clash.
+  //
+  // Axis, pole pairs, gear (except its max speed), SI units and encoder
+  // objects can only be written with the motor unpowered (the manual's
+  // «Power Disable»). Any Apply() that includes one returns
+  // operation_not_permitted, having written nothing, while the drive is
+  // switched on - Disable() first. The rest can be applied at any time.
   std::error_code Apply(const configs::Epos4Configuration & config);
 
-  // Individual groups, for when only one thing needs changing.
-  std::error_code Apply(const configs::MotorConfigs & config);
-  std::error_code Apply(const configs::GearConfigs & config);
-  std::error_code Apply(const configs::AxisConfigs & config);
-  std::error_code Apply(const configs::CurrentControlConfigs & config);
-  std::error_code Apply(const configs::PositionControlConfigs & config);
-  std::error_code Apply(const configs::VelocityControlConfigs & config);
-  std::error_code Apply(const configs::MotionProfileConfigs & config);
-  std::error_code Apply(const configs::LimitConfigs & config);
-  std::error_code Apply(const configs::HomingConfigs & config);
-  std::error_code Apply(const configs::StopOptionConfigs & config);
-  std::error_code Apply(const configs::HoldingBrakeConfigs & config);
-  std::error_code Apply(const configs::StandstillConfigs & config);
-  std::error_code Apply(const configs::DigitalOutputConfigs & config);
+  // Individual groups, for when only one thing needs changing - and each
+  // read back on its own. Refresh() fills every field the group has, from
+  // the same list of objects Apply() writes (see configs/ConfigFields.hpp).
+#define EPOS4_CONFIG_GROUP(Type) \
+  std::error_code Apply(const configs::Type & config); \
+  std::error_code Refresh(configs::Type & config);
+  EPOS4_CONFIG_GROUP(MotorConfigs)
+  EPOS4_CONFIG_GROUP(GearConfigs)
+  EPOS4_CONFIG_GROUP(AxisConfigs)
+  EPOS4_CONFIG_GROUP(CurrentControlConfigs)
+  EPOS4_CONFIG_GROUP(PositionControlConfigs)
+  EPOS4_CONFIG_GROUP(VelocityControlConfigs)
+  EPOS4_CONFIG_GROUP(VelocityObserverConfigs)
+  EPOS4_CONFIG_GROUP(MotionProfileConfigs)
+  EPOS4_CONFIG_GROUP(LimitConfigs)
+  EPOS4_CONFIG_GROUP(HomingConfigs)
+  EPOS4_CONFIG_GROUP(StopOptionConfigs)
+  EPOS4_CONFIG_GROUP(HoldingBrakeConfigs)
+  EPOS4_CONFIG_GROUP(StandstillConfigs)
+  EPOS4_CONFIG_GROUP(DigitalOutputConfigs)
+  EPOS4_CONFIG_GROUP(CyclicConfigs)
+  EPOS4_CONFIG_GROUP(SiUnitConfigs)
+  EPOS4_CONFIG_GROUP(AnalogOutputConfigs)
+  EPOS4_CONFIG_GROUP(ProtectionConfigs)
+  EPOS4_CONFIG_GROUP(CustomPersistentMemoryConfigs)
+  // Node-ID and bit rates take effect after Save() and a restart; see the
+  // warnings on the struct.
+  EPOS4_CONFIG_GROUP(CommunicationConfigs)
+#undef EPOS4_CONFIG_GROUP
 
   // Validates the mapping before writing: the manual forbids the same
   // function on two inputs, and a rejected write halfway through would leave
   // limit switches half configured.
   std::error_code Apply(const configs::DigitalInputConfigs & config);
-  std::error_code Apply(const configs::CyclicConfigs & config);
+  std::error_code Refresh(configs::DigitalInputConfigs & config);
+  // Same check for the analog inputs: one function per input.
+  std::error_code Apply(const configs::AnalogInputConfigs & config);
+  std::error_code Refresh(configs::AnalogInputConfigs & config);
+  // Refuses filter coefficients without filterActive; see the struct.
+  std::error_code Apply(const configs::DualLoopConfigs & config);
+  std::error_code Refresh(configs::DualLoopConfigs & config);
 
-  // Reads the current configuration back out of the device.
+  // Reads the whole configuration back out of the device: every field of
+  // every group. Keeps going past an object that cannot be read and returns
+  // the first error; such fields stay unset.
   std::error_code Refresh(configs::Epos4Configuration & config);
 
   // Persists the current parameters to non-volatile memory (0x1010).
   // Without this everything applied here is lost at the next power cycle.
   std::error_code Save();
 
-  // Restores factory defaults (0x1011). Takes effect after a reset.
+  // Restores factory defaults (0x1011). Takes effect after a reset. Only
+  // with the motor unpowered (operation_not_permitted otherwise) and with
+  // the node in NMT «Pre-Operational» - in «Operational» the drive refuses.
   std::error_code RestoreDefaults();
 
 private:
   std::error_code ApplyWrites(const configs::ConfigWrites & writes);
+
+  // One SDO read per object, typed by the field it is for.
+  configs::ConfigReader Reader();
+
+  // operation_not_permitted unless the drive is in «Power Disable».
+  std::error_code RequirePowerDisabled();
 
   Epos4 & device_;
 };
@@ -350,6 +388,24 @@ public:
   // mid-motion. Not PDO-mappable either.
   signals::StatusSignal<units::temperature::celsius_t> & GetPowerStageTemperature();
   signals::StatusSignal<units::temperature::celsius_t> & GetPowerStageTemperatureLimit();
+
+  // The I2t models (0x3200, 6.2.88) behind «I2t motor» / «I2t power stage»
+  // limiting, in percent. Above 100 the drive is already limiting current:
+  // this is the number to watch when a joint feels weak after a long hold,
+  // well before any error is raised.
+  signals::StatusSignal<std::uint16_t> & GetMotorI2tPercent();
+  signals::StatusSignal<std::uint16_t> & GetPowerStageI2tPercent();
+
+  // The PWM duty cycle, 0x3203:01, in per mille of the supply voltage. Close
+  // to 1000 means the drive has run out of voltage headroom: the velocity
+  // the motor can reach at this supply is the limit, not the controller.
+  signals::StatusSignal<std::uint16_t> & GetPwmDutyCyclePerMille();
+
+  // Safe Torque Off inputs, 0x3202:01, and the STO card status, 0x3202:02
+  // (Module/Compact 60/20 only). Absent on the Disk and Micro variants; the
+  // read then fails with the drive's SDO abort.
+  signals::StatusSignal<signals::StoInputStates> & GetStoInputs();
+  signals::StatusSignal<signals::StoCardStatus> & GetStoCardStatus();
 
   // -------------------------------------------------------------------------
   // More feedback
