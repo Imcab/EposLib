@@ -18,6 +18,17 @@ Communication Guide, edition 2026-04, rel13604**.
 
 ### Added
 
+- `Epos4::GetBootStatus()` and `signals::BootStatus`: how the master's last
+  NMT boot of the node went - the CiA 302-2 error status ('D' vendor-ID
+  mismatch, 'J' configuration download failed, ...) and Lely's text for it.
+  A node whose boot failed still answers SDO, so `WaitUntilReady()` returned
+  true on it and nothing else said so.
+- `CanBus::Start()` may be called again after `Stop()`: the previous master
+  is torn down, every device gets a new driver and the network boots again.
+  Devices, and the signal references taken from them, stay valid.
+  Verified on vcan0 against `epos4_sim`: Stop, Start, the node boots again,
+  `Enable()` succeeds and PDOs flow.
+
 - **PDO mapping inspection** (read-only, `signals/PdoMapping.hpp`):
   `Epos4::ReadPdoMapping()` reads the four RPDOs and four TPDOs - COB-ID,
   transmission type, inhibit time and mapped objects (6.2.15-6.2.30) - and
@@ -223,6 +234,30 @@ Communication Guide, edition 2026-04, rel13604**.
   keeps the CANopen network description, which the library needs.
 
 ### Fixed
+
+- **Every device call before `CanBus::Start()` crashed.** `Enable()`,
+  `Disable()`, `Halt()`, `QuickStop()`, `Home()`, `SetControl()`, every
+  status signal, `ReadObject()` / `WriteObject()` and the `Configurator`
+  dereferenced the driver, which only exists once the bus has started.
+  They now fail with `not_connected` (or false); the signals, the cyclic
+  state and the last EMCY live in `Epos4::Shared`, created with the device,
+  and the driver only holds references into it. `test_device_lifecycle`
+  covers each of them.
+- **A device call after `CanBus::Stop()` hung forever.** SDO transfers are
+  completed or timed out by the bus thread, so once its loop had stopped a
+  `Disable()` in a shutdown path waited on a future nothing would ever
+  set. Calls now fail with `not_connected` at once when the bus is stopped,
+  and give up with `timed_out` after 2 s if its loop dies mid-call; a call
+  given up on is skipped if it has not started, so a write reported as
+  timed out does not land later. Verified on vcan0: returns in 0 ms.
+- **`Stop()` then `Start()` hung in `Start()`.** It replaced the master
+  under the drivers registered with it, and `Attach()` kept the old
+  drivers. See *Added*.
+- **A destroyed `Epos4` stayed registered with its bus**, which attached the
+  dangling pointer on the next `Start()`; on vcan0 the process died at exit.
+  The destructor now unregisters the device and destroys its driver on the
+  bus thread, where the master dispatches to it, as does attaching a device
+  to a running bus.
 
 - `config/epos4_network/bus.yml` disables RPDO3 and RPDO4. The drive's
   defaults leave them valid (Controlword with target position / velocity on

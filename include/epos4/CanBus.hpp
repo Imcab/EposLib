@@ -19,9 +19,9 @@ class Epos4;
 // are constructed against it with their node-ID, the same way a TalonFX is
 // constructed against a named CAN bus.
 //
-//   epos4::CanBus bus{{.interface = "can0", .masterDcf = ".../master.dcf"}};
-//   epos4::Epos4 shoulder{bus, 1};
-//   epos4::Epos4 elbow{bus, 2};
+//   epos4::CanBus bus{{"can0", ".../master.dcf", 1}};  // the master is node 1
+//   epos4::Epos4 shoulder{bus, 2};
+//   epos4::Epos4 elbow{bus, 3};
 //   bus.Start();
 //
 // Devices are declared BEFORE Start(), not after. A CANopen master boots each
@@ -63,10 +63,17 @@ public:
   // work over SDO but receive no PDOs.
   //
   // Throws std::system_error if the interface or the DCF cannot be opened.
+  //
+  // May be called again after Stop(), e.g. to recover from a lost CAN
+  // adapter: the previous master is torn down, every device gets a new
+  // driver and the network is booted again. Devices and the signal
+  // references taken from them stay valid. Not concurrently with calls on
+  // those devices.
   void Start();
 
   // Stops the loop and shuts the network down cleanly, leaving slaves in a
-  // safe state rather than powered and orphaned.
+  // safe state rather than powered and orphaned. Device calls made after it
+  // fail with not_connected instead of waiting for a loop that is gone.
   void Stop();
 
   bool IsRunning() const;
@@ -79,6 +86,10 @@ private:
   // Called by Epos4's constructor. The device is only attached to the master
   // when Start() runs, because the master does not exist until then.
   void Register(Epos4 * device);
+
+  // Called by Epos4's destructor, so that a later Start() does not attach a
+  // device that no longer exists.
+  void Unregister(Epos4 * device);
 
   struct Impl;
   std::unique_ptr<Impl> impl_;

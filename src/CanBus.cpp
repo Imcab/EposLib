@@ -9,6 +9,7 @@
 #include <lely/io2/sys/io.hpp>
 #include <lely/io2/sys/timer.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -94,11 +95,51 @@ CanBus::GetImpl()
 void
 CanBus::Register(Epos4 * device)
 {
+  std::lock_guard<std::mutex> lock{impl_->devicesMutex};
   impl_->devices.push_back(device);
   // If the bus is already up, attach immediately. The device will talk SDO
   // but will not receive PDOs until the next Start().
   if (impl_->running.load() && impl_->master) {
-    device->Attach(*impl_->master);
+    impl_->RunOnLoop([this, device]() {device->Attach(*impl_->master);});
+  }
+}
+
+void
+CanBus::Unregister(Epos4 * device)
+{
+  std::lock_guard<std::mutex> lock{impl_->devicesMutex};
+  auto & devices = impl_->devices;
+  devices.erase(std::remove(devices.begin(), devices.end(), device), devices.end());
+}
+
+void
+CanBus::Impl::RunOnLoop(const std::function<void()> & task)
+{
+  if (!running.load() || !loop || std::this_thread::get_id() == thread.get_id()) {
+    task();
+    return;
+  }
+
+  // Whoever claims it runs it, exactly once: the loop if it gets there, this
+  // thread if the loop exits first - a task posted to a loop that is on its
+  // way out may never be picked up.
+  auto claimed = std::make_shared<std::atomic<bool>>(false);
+  auto done = std::make_shared<std::promise<void>>();
+  auto finished = done->get_future();
+  loop->get_executor().post(
+    [claimed, done, task]() {
+      if (!claimed->exchange(true)) {
+        task();
+        done->set_value();
+      }
+    });
+  // `running` rather than loopExitedFuture: the loop thread clears it as
+  // run() returns, and an atomic may be polled from any thread.
+  while (finished.wait_for(std::chrono::milliseconds{10}) != std::future_status::ready) {
+    if (!running.load() && !claimed->exchange(true)) {
+      task();
+      return;
+    }
   }
 }
 
@@ -113,6 +154,25 @@ CanBus::Start()
   }
 
   auto & d = *impl_;
+  std::lock_guard<std::mutex> lock{d.devicesMutex};
+
+  // Started before: take the previous run's stack down first, drivers before
+  // the master they are registered with, then the rest in reverse order of
+  // construction. Replacing the master under live drivers left every device
+  // talking to a destroyed one, and the new I/O context could not start.
+  if (d.master) {
+    for (auto * device : d.devices) {
+      device->Detach();
+    }
+    d.master.reset();
+    d.chan.reset();
+    d.ctrl.reset();
+    d.timer.reset();
+    d.loop.reset();
+    d.poll.reset();
+    d.ctx.reset();
+    d.ioGuard.reset();
+  }
 
   d.ioGuard = std::make_unique<lely::io::IoGuard>();
   d.ctx = std::make_unique<lely::io::Context>();

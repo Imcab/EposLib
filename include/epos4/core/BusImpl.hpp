@@ -13,8 +13,10 @@
 #include <lely/io2/sys/timer.hpp>
 
 #include <atomic>
+#include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -40,6 +42,9 @@ struct CanBus::Impl
   std::unique_ptr<lely::canopen::AsyncMaster> master;
 
   // Devices registered before Start(), attached to the master when it runs.
+  // Guarded because devices are constructed and destroyed on whichever
+  // thread the application likes.
+  std::mutex devicesMutex;
   std::vector<Epos4 *> devices;
 
   std::thread thread;
@@ -49,6 +54,11 @@ struct CanBus::Impl
   // the loop to finish by itself, and only forces it after a grace period.
   std::promise<void> loopExited;
   std::future<void> loopExitedFuture;
+
+  // Runs `task` on the loop's thread and waits for it, or runs it right here
+  // when no loop is running. Registering a driver with the master and
+  // removing one must not race with the loop dispatching frames to it.
+  void RunOnLoop(const std::function<void()> & task);
 };
 
 }  // namespace epos4

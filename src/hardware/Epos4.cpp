@@ -24,12 +24,118 @@ constexpr auto kPollInterval = std::chrono::milliseconds{5};
 }
 
 // ---------------------------------------------------------------------------
+// The part of a device that does not depend on a master existing: the status
+// signals, the cyclic state and the last EMCY.
+//
+// Created with the device, and the driver (Impl) holds references into it.
+// So every accessor works before CanBus::Start() - a signal refreshed then
+// reports not_connected, where it used to dereference a null Impl - and the
+// references a caller took stay valid when a restart of the bus replaces the
+// driver.
+//
+// The signals read through the Read() family below, which forwards to
+// whichever driver the device has at the moment.
+// ---------------------------------------------------------------------------
+struct Epos4::Shared
+{
+  explicit Shared(Epos4 & owner)
+  : device(owner) {}
+
+  template<typename T>
+  std::error_code Read(od::Entry entry, T & out);
+  template<typename T>
+  std::error_code Write(od::Entry entry, T value);
+  template<typename T>
+  std::error_code ReadPreferPdo(od::Entry entry, T & out);
+  std::error_code ReadStatusword(std::uint16_t & out);
+
+  Epos4 & device;
+
+  // Everything the cyclic path shares between the control thread and the
+  // bus thread: the last feedback received, the staged setpoint, and the rule for
+  // trusting them. Lock-free throughout; see core::CyclicState.
+  core::CyclicState cyclic;
+
+  // «Motor rated torque», read when torque mode is entered, so a torque in
+  // N m can be staged from the control loop without an SDO read there.
+  std::atomic<std::uint32_t> cyclicRatedTorque{0};
+
+  // Guarded because it is set from the application thread and read from the
+  // CANopen thread inside OnEmcy.
+  std::mutex emcyMutex;
+  std::function<void(const signals::EmergencyMessage &)> emcyCallback;
+
+  // The code of the last EMCY, for readers that must not touch the bus. An
+  // EMCY with code 0 is the drive announcing that its errors were reset, so
+  // storing it as-is also clears this when the fault is cleared.
+  std::atomic<std::uint16_t> lastEmcyCode{0};
+  std::atomic<long long> lastEmcy{0};  // steady_clock ticks, 0 = never
+
+  // How the last boot of the node went; see Epos4::GetBootStatus().
+  mutable std::mutex bootMutex;
+  signals::BootStatus boot;
+
+  // Status signals live here so the device can hand out references to them.
+  signals::StatusSignal<signals::State> state;
+  signals::StatusSignal<std::uint16_t> statusword;
+  signals::StatusSignal<signals::OperationMode> mode;
+  signals::StatusSignal<std::int32_t> position;
+  signals::StatusSignal<std::int32_t> positionDemand;
+  signals::StatusSignal<std::int32_t> velocity;
+  signals::StatusSignal<std::int32_t> velocityDemand;
+  signals::StatusSignal<std::int16_t> torque;
+  signals::StatusSignal<std::int32_t> followingError;
+  signals::StatusSignal<std::int16_t> currentDemand;
+  signals::StatusSignal<std::uint16_t> errorCode;
+  signals::StatusSignal<std::uint8_t> errorRegister;
+  signals::StatusSignal<bool> targetReached;
+  signals::StatusSignal<bool> setpointAcknowledged;
+  signals::StatusSignal<bool> followingErrorFlag;
+  signals::StatusSignal<bool> homingAttained;
+  signals::StatusSignal<bool> internalLimit;
+  signals::StatusSignal<bool> warning;
+  signals::StatusSignal<bool> homingError;
+  signals::StatusSignal<bool> atZeroSpeed;
+  signals::StatusSignal<bool> followingCommand;
+  signals::StatusSignal<bool> positionReferenced;
+  signals::StatusSignal<bool> remote;
+  signals::StatusSignal<bool> voltageEnabled;
+  signals::StatusSignal<signals::BrakeState> brakeState;
+  signals::StatusSignal<std::uint32_t> digitalInputs;
+  signals::StatusSignal<std::uint32_t> motorRatedTorque;
+  signals::StatusSignal<std::uint16_t> digitalInputPins;
+  signals::StatusSignal<std::uint32_t> digitalOutputs;
+  signals::StatusSignal<std::uint16_t> digitalOutputPins;
+
+  signals::StatusSignal<std::int16_t> torqueAveraged;
+  signals::StatusSignal<std::int32_t> velocityAveraged;
+  signals::StatusSignal<signals::CanBitRate> canBitRate;
+  signals::StatusSignal<signals::Fieldbus> activeFieldbus;
+  signals::StatusSignal<std::uint32_t> supportedDriveModes;
+  signals::StatusSignal<units::voltage::volt_t> analogInputVoltage[2];
+  signals::StatusSignal<units::voltage::volt_t> analogInputGeneralPurpose[2];
+  signals::StatusSignal<units::voltage::volt_t> analogOutputVoltage[2];
+
+  signals::StatusSignal<units::current::ampere_t> motorCurrent;
+  signals::StatusSignal<units::current::ampere_t> motorCurrentAveraged;
+  signals::StatusSignal<units::voltage::volt_t> supplyVoltage;
+  signals::StatusSignal<units::temperature::celsius_t> powerStageTemperature;
+  signals::StatusSignal<units::temperature::celsius_t> powerStageTemperatureLimit;
+  signals::StatusSignal<std::uint16_t> motorI2t;
+  signals::StatusSignal<std::uint16_t> powerStageI2t;
+  signals::StatusSignal<std::uint16_t> pwmDutyCycle;
+  signals::StatusSignal<signals::StoInputStates> stoInputs;
+  signals::StatusSignal<signals::StoCardStatus> stoCardStatus;
+};
+
+
+// ---------------------------------------------------------------------------
 // The Lely side of a device. Kept in the .cpp so that no Lely header reaches
 // anything a user of this library includes.
 //
 // Every public call below is synchronous from the caller's thread: it posts
 // onto the driver's executor and blocks on a future until the answer comes
-// back.
+// back, or kCallTimeout passes.
 //
 // LoopDriver rather than FiberDriver, for two reasons:
 //
@@ -49,46 +155,104 @@ constexpr auto kPollInterval = std::chrono::milliseconds{5};
 // ---------------------------------------------------------------------------
 struct Epos4::Impl : public lely::canopen::LoopDriver
 {
-  Impl(lely::canopen::AsyncMaster & master, std::uint8_t id)
-  : LoopDriver(master, id) {}
+  Impl(
+    lely::canopen::AsyncMaster & master, std::uint8_t id, Shared & shared,
+    const std::atomic<bool> & busRunning);
+
+  // Runs `task` on the driver's thread, hands it a value of its own to fill
+  // in, and copies that into `out` once it succeeds.
+  //
+  // Waits, but not forever. An SDO completes or times out on the bus thread
+  // (Lely's master supplies the timeout), so with the bus running the answer
+  // always comes. Once the bus has stopped nothing completes it any more, and
+  // a plain future.get() here hung for good: a Disable() after
+  // CanBus::Stop(), in exactly the shutdown path that must not hang. So a
+  // stopped bus fails at once, and kCallTimeout backs that up for a loop that
+  // dies mid-call.
+  //
+  // A call given up on is marked abandoned and skipped if it has not started
+  // yet, so a write the caller was told timed out does not land seconds later.
+  template<typename T, typename Task>
+  std::error_code Call(T & out, Task task)
+  {
+    if (!busRunning.load()) {
+      return std::make_error_code(std::errc::not_connected);
+    }
+    struct Pending
+    {
+      std::promise<std::error_code> done;
+      std::atomic<bool> abandoned{false};
+      T value{};
+    };
+    // Shared with the task, which may outlive this call when it times out.
+    auto pending = std::make_shared<Pending>();
+    auto future = pending->done.get_future();
+    Defer(
+      [pending, task]() mutable {
+        if (pending->abandoned.load()) {
+          pending->done.set_value(std::make_error_code(std::errc::operation_canceled));
+          return;
+        }
+        pending->done.set_value(task(pending->value));
+      });
+    if (future.wait_for(kCallTimeout) != std::future_status::ready) {
+      pending->abandoned.store(true);
+      return std::make_error_code(std::errc::timed_out);
+    }
+    const std::error_code ec = future.get();
+    if (!ec) {
+      out = std::move(pending->value);
+    }
+    return ec;
+  }
+
+  // The same for a task with nothing to hand back.
+  template<typename Task>
+  std::error_code Call(Task task)
+  {
+    struct Nothing {};
+    Nothing unused;
+    return Call(unused, [task](Nothing &) mutable {return task();});
+  }
+
+  // Far beyond any single SDO transfer, so it only fires when the loop that
+  // should complete one is gone.
+  static constexpr std::chrono::seconds kCallTimeout{2};
 
   template<typename T>
   std::error_code Read(od::Entry entry, T & out)
   {
-    std::promise<std::error_code> promise;
-    auto future = promise.get_future();
-    Defer(
-      [this, entry, &out, &promise]() {
+    return Call(
+      out, [this, entry](T & value) -> std::error_code {
         try {
-          out = Wait(AsyncRead<T>(entry.index, entry.subindex));
-          promise.set_value(std::error_code{});
+          value = Wait(AsyncRead<T>(entry.index, entry.subindex));
+          return {};
         } catch (lely::canopen::SdoError & e) {
-          promise.set_value(e.code());
+          return e.code();
         } catch (...) {
-          promise.set_value(std::make_error_code(std::errc::io_error));
+          return std::make_error_code(std::errc::io_error);
         }
       });
-    return future.get();
   }
 
   template<typename T>
   std::error_code Write(od::Entry entry, T value)
   {
-    std::promise<std::error_code> promise;
-    auto future = promise.get_future();
-    Defer(
-      [this, entry, value, &promise]() {
+    return Call(
+      [this, entry, value]() -> std::error_code {
         try {
           Wait(AsyncWrite<T>(entry.index, entry.subindex, T{value}));
-          promise.set_value(std::error_code{});
+          return {};
         } catch (lely::canopen::SdoError & e) {
-          promise.set_value(e.code());
+          return e.code();
         } catch (...) {
-          promise.set_value(std::make_error_code(std::errc::io_error));
+          return std::make_error_code(std::errc::io_error);
         }
       });
-    return future.get();
   }
+
+  Shared & shared;
+  const std::atomic<bool> & busRunning;
 
   // -------------------------------------------------------------------------
   // NMT
@@ -99,25 +263,20 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // reconfigured, rather than guessing with a sleep.
   std::atomic<unsigned> bootCount{0};
 
-  void OnBoot(lely::canopen::NmtState st, char es, const std::string & what) noexcept override
-  {
-    LoopDriver::OnBoot(st, es, what);  // keeps the default notifications
-    bootCount.fetch_add(1, std::memory_order_release);
-  }
+  // Also keeps how the boot went, which nothing else reports: a node whose
+  // identity check or configuration download failed still answers SDO.
+  void OnBoot(lely::canopen::NmtState st, char es, const std::string & what) noexcept override;
 
   // The concise DCF the master downloads to this node at boot - read from
   // the master's own dictionary, on the bus thread like every access to it.
   std::error_code ReadConciseDcf(std::vector<std::uint8_t> & out)
   {
-    std::promise<std::error_code> promise;
-    auto future = promise.get_future();
-    Defer(
-      [this, &out, &promise]() {
+    return Call(
+      out, [this](std::vector<std::uint8_t> & value) {
         std::error_code ec;
-        out = master.Read<std::vector<std::uint8_t>>(od::comm::kConciseDcf, id(), ec);
-        promise.set_value(ec);
+        value = master.Read<std::vector<std::uint8_t>>(od::comm::kConciseDcf, id(), ec);
+        return ec;
       });
-    return future.get();
   }
 
   // NMT reset communication, to this node only. The node reloads its
@@ -125,16 +284,13 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   // the master answers that by booting it again - downloading the concise
   // DCF, PDO mapping and heartbeat consumer included - which is what makes
   // OnBoot() run.
-  void ResetCommunication()
+  std::error_code ResetCommunication()
   {
-    std::promise<void> promise;
-    auto future = promise.get_future();
-    Defer(
-      [this, &promise]() {
+    return Call(
+      [this]() {
         master.Command(lely::canopen::NmtCommand::RESET_COMM, id());
-        promise.set_value();
+        return std::error_code{};
       });
-    future.get();
   }
 
   // -------------------------------------------------------------------------
@@ -234,18 +390,15 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   template<typename T>
   std::error_code ReadMapped(od::Entry entry, T & out)
   {
-    std::promise<std::error_code> promise;
-    auto future = promise.get_future();
-    Defer(
-      [this, entry, &out, &promise]() {
+    return Call(
+      out, [this, entry](T & value) -> std::error_code {
         try {
-          out = rpdo_mapped[entry.index][entry.subindex];
-          promise.set_value(std::error_code{});
+          value = rpdo_mapped[entry.index][entry.subindex];
+          return {};
         } catch (...) {
-          promise.set_value(std::make_error_code(std::errc::no_message_available));
+          return std::make_error_code(std::errc::no_message_available);
         }
       });
-    return future.get();
   }
 
   // Stages a value the master publishes over RPDO. It goes out on the next
@@ -253,18 +406,15 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
   template<typename T>
   std::error_code WriteMapped(od::Entry entry, T value)
   {
-    std::promise<std::error_code> promise;
-    auto future = promise.get_future();
-    Defer(
-      [this, entry, value, &promise]() {
+    return Call(
+      [this, entry, value]() -> std::error_code {
         try {
           tpdo_mapped[entry.index][entry.subindex] = value;
-          promise.set_value(std::error_code{});
+          return {};
         } catch (...) {
-          promise.set_value(std::make_error_code(std::errc::no_message_available));
+          return std::make_error_code(std::errc::no_message_available);
         }
       });
-    return future.get();
   }
 
   bool PdoActive() const {return cyclic.HasReceivedPdo();}
@@ -382,14 +532,11 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
     }
   }
 
-  // Everything the cyclic path shares between the control thread and this
-  // one: the last feedback received, the staged setpoint, and the rule for
-  // trusting them. Lock-free throughout; see core::CyclicState.
-  core::CyclicState cyclic;
+  // The cyclic state lives in Shared, so the lock-free accessors work with
+  // or without a driver; this is a view of it for the bus thread.
+  core::CyclicState & cyclic;
 
-  // «Motor rated torque», read when torque mode is entered, so a torque in
-  // N m can be staged from the control loop without an SDO read there.
-  std::atomic<std::uint32_t> cyclicRatedTorque{0};
+  std::atomic<std::uint32_t> & cyclicRatedTorque;
 
 
   // Makes sure the drive is in the mode a control request needs. Writing
@@ -428,46 +575,6 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
 
   core::Controlword controlword;
 
-  // Status signals live here so the device can hand out references to them.
-  signals::StatusSignal<signals::State> state;
-  signals::StatusSignal<std::uint16_t> statusword;
-  signals::StatusSignal<signals::OperationMode> mode;
-  signals::StatusSignal<std::int32_t> position;
-  signals::StatusSignal<std::int32_t> positionDemand;
-  signals::StatusSignal<std::int32_t> velocity;
-  signals::StatusSignal<std::int32_t> velocityDemand;
-  signals::StatusSignal<std::int16_t> torque;
-  signals::StatusSignal<std::int32_t> followingError;
-  signals::StatusSignal<std::int16_t> currentDemand;
-  signals::StatusSignal<std::uint16_t> errorCode;
-  signals::StatusSignal<std::uint8_t> errorRegister;
-  signals::StatusSignal<bool> targetReached;
-  signals::StatusSignal<bool> setpointAcknowledged;
-  signals::StatusSignal<bool> followingErrorFlag;
-  signals::StatusSignal<bool> homingAttained;
-  signals::StatusSignal<bool> internalLimit;
-  signals::StatusSignal<bool> warning;
-  signals::StatusSignal<bool> homingError;
-  signals::StatusSignal<bool> atZeroSpeed;
-  signals::StatusSignal<bool> followingCommand;
-  signals::StatusSignal<bool> positionReferenced;
-  signals::StatusSignal<bool> remote;
-  signals::StatusSignal<bool> voltageEnabled;
-  signals::StatusSignal<signals::BrakeState> brakeState;
-  signals::StatusSignal<std::uint32_t> digitalInputs;
-  signals::StatusSignal<std::uint32_t> motorRatedTorque;
-  signals::StatusSignal<std::uint16_t> digitalInputPins;
-  signals::StatusSignal<std::uint32_t> digitalOutputs;
-  signals::StatusSignal<std::uint16_t> digitalOutputPins;
-
-  signals::StatusSignal<std::int16_t> torqueAveraged;
-  signals::StatusSignal<std::int32_t> velocityAveraged;
-  signals::StatusSignal<signals::CanBitRate> canBitRate;
-  signals::StatusSignal<signals::Fieldbus> activeFieldbus;
-  signals::StatusSignal<std::uint32_t> supportedDriveModes;
-  signals::StatusSignal<units::voltage::volt_t> analogInputVoltage[2];
-  signals::StatusSignal<units::voltage::volt_t> analogInputGeneralPurpose[2];
-  signals::StatusSignal<units::voltage::volt_t> analogOutputVoltage[2];
 
   // What the drive can do, read once: they are constants of the firmware.
   // Guarded because EnsureMode() and Home() may be called from several
@@ -517,28 +624,11 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
     return knownHomingMethods;
   }
 
-  signals::StatusSignal<units::current::ampere_t> motorCurrent;
-  signals::StatusSignal<units::current::ampere_t> motorCurrentAveraged;
-  signals::StatusSignal<units::voltage::volt_t> supplyVoltage;
-  signals::StatusSignal<units::temperature::celsius_t> powerStageTemperature;
-  signals::StatusSignal<units::temperature::celsius_t> powerStageTemperatureLimit;
-  signals::StatusSignal<std::uint16_t> motorI2t;
-  signals::StatusSignal<std::uint16_t> powerStageI2t;
-  signals::StatusSignal<std::uint16_t> pwmDutyCycle;
-  signals::StatusSignal<signals::StoInputStates> stoInputs;
-  signals::StatusSignal<signals::StoCardStatus> stoCardStatus;
-
-
-  // Guarded because it is set from the application thread and read from the
-  // CANopen thread inside OnEmcy.
-  std::mutex emcyMutex;
-  std::function<void(const signals::EmergencyMessage &)> emcyCallback;
-
-  // The code of the last EMCY, for readers that must not touch the bus. An
-  // EMCY with code 0 is the drive announcing that its errors were reset, so
-  // storing it as-is also clears this when the fault is cleared.
-  std::atomic<std::uint16_t> lastEmcyCode{0};
-  std::atomic<long long> lastEmcy{0};  // steady_clock ticks, 0 = never
+  // Live in Shared, which outlives this driver; see there.
+  std::mutex & emcyMutex;
+  std::function<void(const signals::EmergencyMessage &)> & emcyCallback;
+  std::atomic<std::uint16_t> & lastEmcyCode;
+  std::atomic<long long> & lastEmcy;
 
   void OnEmcy(std::uint16_t eec, std::uint8_t er, std::uint8_t msef[5]) noexcept override
   {
@@ -566,6 +656,68 @@ struct Epos4::Impl : public lely::canopen::LoopDriver
 };
 
 
+Epos4::Impl::Impl(
+  lely::canopen::AsyncMaster & master, std::uint8_t id, Shared & shared,
+  const std::atomic<bool> & busRunning)
+: LoopDriver(master, id),
+  shared(shared),
+  busRunning(busRunning),
+  cyclic(shared.cyclic),
+  cyclicRatedTorque(shared.cyclicRatedTorque),
+  emcyMutex(shared.emcyMutex),
+  emcyCallback(shared.emcyCallback),
+  lastEmcyCode(shared.lastEmcyCode),
+  lastEmcy(shared.lastEmcy)
+{
+}
+
+void
+Epos4::Impl::OnBoot(lely::canopen::NmtState st, char es, const std::string & what) noexcept
+{
+  LoopDriver::OnBoot(st, es, what);  // keeps the default notifications
+  const unsigned count = bootCount.fetch_add(1, std::memory_order_release) + 1;
+  try {
+    std::lock_guard<std::mutex> lock{shared.bootMutex};
+    shared.boot.count = count;
+    shared.boot.errorStatus = es;
+    shared.boot.what = what;
+  } catch (...) {
+    // Copying the text failed; the count and status are what matter.
+  }
+}
+
+template<typename T>
+std::error_code
+Epos4::Shared::Read(od::Entry entry, T & out)
+{
+  if (!device.impl_) {return std::make_error_code(std::errc::not_connected);}
+  return device.impl_->Read<T>(entry, out);
+}
+
+template<typename T>
+std::error_code
+Epos4::Shared::Write(od::Entry entry, T value)
+{
+  if (!device.impl_) {return std::make_error_code(std::errc::not_connected);}
+  return device.impl_->Write<T>(entry, value);
+}
+
+template<typename T>
+std::error_code
+Epos4::Shared::ReadPreferPdo(od::Entry entry, T & out)
+{
+  if (!device.impl_) {return std::make_error_code(std::errc::not_connected);}
+  return device.impl_->ReadPreferPdo<T>(entry, out);
+}
+
+std::error_code
+Epos4::Shared::ReadStatusword(std::uint16_t & out)
+{
+  if (!device.impl_) {return std::make_error_code(std::errc::not_connected);}
+  return device.impl_->ReadStatusword(out);
+}
+
+
 // ---------------------------------------------------------------------------
 // Configurator
 // ---------------------------------------------------------------------------
@@ -587,7 +739,7 @@ Configurator::ApplyWrites(const configs::ConfigWrites & writes)
   for (const auto & w : writes) {
     const std::error_code ec = std::visit(
       [&](auto value) {
-        return device_.impl_->Write(w.entry, value);
+        return device_.shared_->Write(w.entry, value);
       },
       w.value);
     if (ec) {
@@ -609,7 +761,7 @@ Configurator::Apply(const configs::Epos4Configuration & config)
 configs::ConfigReader
 Configurator::Reader()
 {
-  auto & d = *device_.impl_;
+  auto & d = *device_.shared_;
   return [&d](od::Entry entry, configs::ConfigValue & value) {
            return std::visit([&](auto & typed) {return d.Read(entry, typed);}, value);
          };
@@ -720,7 +872,7 @@ Configurator::Save()
 {
   // 0x1010:01, signature "save" as little-endian ASCII. Section 6.2.6.
   constexpr std::uint32_t kSaveSignature = 0x65766173;  // 's','a','v','e'
-  return device_.impl_->Write<std::uint32_t>(
+  return device_.shared_->Write<std::uint32_t>(
     od::comm::kStoreParameters_SaveAllParameters,
     kSaveSignature);
 }
@@ -736,7 +888,7 @@ Configurator::RestoreDefaults()
     return ec;
   }
   constexpr std::uint32_t kLoadSignature = 0x64616F6C;  // 'l','o','a','d'
-  return device_.impl_->Write<std::uint32_t>(
+  return device_.shared_->Write<std::uint32_t>(
     od::comm::kRestoreDefaultParameters_RestoreAllDefaultParameters, kLoadSignature);
 }
 
@@ -756,33 +908,16 @@ namespace epos4
 // ---------------------------------------------------------------------------
 
 Epos4::Epos4(CanBus & bus, std::uint8_t nodeId)
-: nodeId_(nodeId),
+: bus_(bus),
+  nodeId_(nodeId),
+  shared_(std::make_unique<Shared>(*this)),
   configurator_(std::make_unique<Configurator>(*this)),
   encoder_(std::make_unique<Encoder>(*this))
 {
   // Nothing that talks to the bus is created here: the master does not exist
-  // until CanBus::Start().
-  // Registering now means Start() can attach this device before it resets the
-  // network, which is what gets this node's PDOs routed to us.
-  bus.Register(this);
-}
-
-void
-Epos4::Attach(lely_master_t & master)
-{
-  if (impl_) {
-    return;
-  }
-  impl_ = std::make_unique<Impl>(master, nodeId_);
-  if (pendingEmcyCallback_) {
-    // Locked like any other hand-over: constructing the driver has already
-    // registered it with the master, so OnEmcy may in principle run now.
-    std::lock_guard<std::mutex> lock{impl_->emcyMutex};
-    impl_->emcyCallback = std::move(pendingEmcyCallback_);
-    pendingEmcyCallback_ = nullptr;
-  }
-
-  auto & d = *impl_;
+  // until CanBus::Start(). The signals are, reading through Shared, which
+  // answers not_connected until there is a driver to read from.
+  auto & d = *shared_;
 
   // Each signal knows how to fetch itself. Wiring them here keeps the
   // accessors below trivial and keeps every object index in one place.
@@ -1025,9 +1160,46 @@ Epos4::Attach(lely_master_t & master)
       if (!ec) {out = static_cast<signals::BrakeState>(raw);}
       return ec;
     });
+
+  // Registering now means Start() can attach this device before it resets the
+  // network, which is what gets this node's PDOs routed to us.
+  bus.Register(this);
 }
 
-Epos4::~Epos4() = default;
+void
+Epos4::Attach(lely_master_t & master)
+{
+  if (impl_) {
+    return;
+  }
+  // A new driver means a node booted afresh: whatever the cyclic path was
+  // publishing belongs to the previous run, and so does its boot status.
+  shared_->cyclic.Deactivate();
+  {
+    std::lock_guard<std::mutex> lock{shared_->bootMutex};
+    shared_->boot = {};
+  }
+  impl_ = std::make_unique<Impl>(master, nodeId_, *shared_, bus_.GetImpl().running);
+}
+
+void
+Epos4::Detach()
+{
+  if (!impl_) {
+    return;
+  }
+  // On the bus thread while it runs: the driver unregisters from the master
+  // as it is destroyed, and must not do so while the loop is dispatching a
+  // frame to it.
+  bus_.GetImpl().RunOnLoop([this]() {impl_.reset();});
+}
+
+Epos4::~Epos4()
+{
+  // First, so a Start() on another thread can no longer attach this device.
+  bus_.Unregister(this);
+  Detach();
+}
 
 std::uint8_t
 Epos4::GetNodeId() const
@@ -1081,8 +1253,10 @@ RunToGoal(Epos4::Impl & d, core::Goal goal, std::chrono::milliseconds timeout)
     // master starts routinely fails with "SDO connection not available"
     // because the node has not finished booting, and a drive that answers
     // late is not a drive that refused. Retry until the deadline; the
-    // deadline is what gives up, not the first hiccup.
-    if (d.ReadStatusword(sw)) {
+    // deadline is what gives up, not the first hiccup. A bus that has
+    // stopped is not a hiccup, though: nothing will answer before it.
+    if (auto ec = d.ReadStatusword(sw)) {
+      if (ec == std::errc::not_connected) {return false;}
       std::this_thread::sleep_for(kPollInterval);
       continue;
     }
@@ -1132,8 +1306,12 @@ Epos4::WaitUntilReady(std::chrono::milliseconds timeout)
     // false forever. What callers actually need to know is whether the node
     // answers, so ask it.
     std::uint16_t statusword{};
-    if (!impl_->Read<std::uint16_t>(od::At(od::cia402::kStatusword), statusword)) {
+    const auto ec = impl_->Read<std::uint16_t>(od::At(od::cia402::kStatusword), statusword);
+    if (!ec) {
       return true;
+    }
+    if (ec == std::errc::not_connected) {
+      return false;   // the bus has stopped
     }
     std::this_thread::sleep_for(kPollInterval);
   }
@@ -1143,12 +1321,14 @@ Epos4::WaitUntilReady(std::chrono::milliseconds timeout)
 bool
 Epos4::Enable(std::chrono::milliseconds timeout)
 {
+  if (!impl_) {return false;}
   return RunToGoal(*impl_, core::Goal::kOperational, timeout);
 }
 
 bool
 Epos4::Disable(std::chrono::milliseconds timeout)
 {
+  if (!impl_) {return false;}
   return RunToGoal(*impl_, core::Goal::kDisabled, timeout);
 }
 
@@ -1180,7 +1360,7 @@ Epos4::ClearFault(std::chrono::milliseconds timeout)
     signals::RequiresCommunicationReset(errorCode))
   {
     const unsigned bootsBefore = d.bootCount.load(std::memory_order_acquire);
-    d.ResetCommunication();
+    if (d.ResetCommunication()) {return false;}
 
     // Wait for the master to have booted the node again: until then its PDO
     // mapping and heartbeat consumer are the power-on defaults, and an SDO
@@ -1219,6 +1399,7 @@ Epos4::ClearFault(std::chrono::milliseconds timeout)
 std::error_code
 Epos4::Halt()
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
   d.controlword.SetModeBits(signals::control_bits::kHalt);
   return d.WriteControlword();
@@ -1227,6 +1408,7 @@ Epos4::Halt()
 std::error_code
 Epos4::QuickStop()
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
   d.controlword.Apply(core::Command::kQuickStop);
   return d.WriteControlword();
@@ -1258,6 +1440,7 @@ Epos4::IsFaulted()
 std::error_code
 Epos4::SetControl(const controls::ProfilePosition & request)
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
 
   if (auto ec = d.EnsureMode(controls::ProfilePosition::kMode)) {return ec;}
@@ -1345,6 +1528,7 @@ Epos4::SetControl(const controls::ProfilePosition & request)
 std::error_code
 Epos4::SetControl(const controls::ProfileVelocity & request)
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
 
   if (auto ec = d.EnsureMode(controls::ProfileVelocity::kMode)) {return ec;}
@@ -1394,6 +1578,7 @@ ResolveTorque(
 std::error_code
 Epos4::SetControl(const controls::CyclicPosition & request)
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
 
   // Everything resolved before anything is written: a request that cannot
@@ -1410,7 +1595,7 @@ Epos4::SetControl(const controls::CyclicPosition & request)
   }
   std::int16_t torqueOffset{};
   if (request.torqueOffset) {
-    if (auto ec = ResolveTorque(d.motorRatedTorque, *request.torqueOffset, torqueOffset)) {
+    if (auto ec = ResolveTorque(shared_->motorRatedTorque, *request.torqueOffset, torqueOffset)) {
       return ec;
     }
   }
@@ -1433,6 +1618,7 @@ Epos4::SetControl(const controls::CyclicPosition & request)
 std::error_code
 Epos4::SetControl(const controls::CyclicVelocity & request)
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
 
   std::int32_t targetRpm{};
@@ -1447,7 +1633,7 @@ Epos4::SetControl(const controls::CyclicVelocity & request)
   }
   std::int16_t torqueOffset{};
   if (request.torqueOffset) {
-    if (auto ec = ResolveTorque(d.motorRatedTorque, *request.torqueOffset, torqueOffset)) {
+    if (auto ec = ResolveTorque(shared_->motorRatedTorque, *request.torqueOffset, torqueOffset)) {
       return ec;
     }
   }
@@ -1467,13 +1653,14 @@ Epos4::SetControl(const controls::CyclicVelocity & request)
 std::error_code
 Epos4::SetControl(const controls::CyclicTorque & request)
 {
+  if (!impl_) {return std::make_error_code(std::errc::not_connected);}
   auto & d = *impl_;
 
   std::int16_t target{};
-  if (auto ec = ResolveTorque(d.motorRatedTorque, request.torque, target)) {return ec;}
+  if (auto ec = ResolveTorque(shared_->motorRatedTorque, request.torque, target)) {return ec;}
   std::int16_t torqueOffset{};
   if (request.torqueOffset) {
-    if (auto ec = ResolveTorque(d.motorRatedTorque, *request.torqueOffset, torqueOffset)) {
+    if (auto ec = ResolveTorque(shared_->motorRatedTorque, *request.torqueOffset, torqueOffset)) {
       return ec;
     }
   }
@@ -1548,6 +1735,7 @@ Epos4::SetPosition(PositionSetpoint position, std::chrono::milliseconds timeout)
 bool
 Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
 {
+  if (!impl_) {return false;}
   auto & d = *impl_;
 
   if (d.EnsureMode(controls::Homing::kMode)) {return false;}
@@ -1638,76 +1826,79 @@ Epos4::Home(const controls::Homing & request, std::chrono::milliseconds timeout)
 // Status signal accessors
 // ---------------------------------------------------------------------------
 
-signals::StatusSignal<signals::State> & Epos4::GetState() {return impl_->state;}
-signals::StatusSignal<std::uint16_t> & Epos4::GetStatusword() {return impl_->statusword;}
-signals::StatusSignal<signals::OperationMode> & Epos4::GetOperationMode() {return impl_->mode;}
-signals::StatusSignal<std::int32_t> & Epos4::GetPosition() {return impl_->position;}
-signals::StatusSignal<std::int32_t> & Epos4::GetPositionDemand() {return impl_->positionDemand;}
-signals::StatusSignal<std::int32_t> & Epos4::GetVelocity() {return impl_->velocity;}
-signals::StatusSignal<std::int32_t> & Epos4::GetVelocityDemand() {return impl_->velocityDemand;}
-signals::StatusSignal<std::int16_t> & Epos4::GetTorque() {return impl_->torque;}
-signals::StatusSignal<std::int32_t> & Epos4::GetFollowingError() {return impl_->followingError;}
-signals::StatusSignal<std::int16_t> & Epos4::GetCurrentDemand() {return impl_->currentDemand;}
+signals::StatusSignal<signals::State> & Epos4::GetState() {return shared_->state;}
+signals::StatusSignal<std::uint16_t> & Epos4::GetStatusword() {return shared_->statusword;}
+signals::StatusSignal<signals::OperationMode> & Epos4::GetOperationMode() {return shared_->mode;}
+signals::StatusSignal<std::int32_t> & Epos4::GetPosition() {return shared_->position;}
+signals::StatusSignal<std::int32_t> & Epos4::GetPositionDemand() {return shared_->positionDemand;}
+signals::StatusSignal<std::int32_t> & Epos4::GetVelocity() {return shared_->velocity;}
+signals::StatusSignal<std::int32_t> & Epos4::GetVelocityDemand() {return shared_->velocityDemand;}
+signals::StatusSignal<std::int16_t> & Epos4::GetTorque() {return shared_->torque;}
+signals::StatusSignal<std::int32_t> & Epos4::GetFollowingError() {return shared_->followingError;}
+signals::StatusSignal<std::int16_t> & Epos4::GetCurrentDemand() {return shared_->currentDemand;}
 
 signals::StatusSignal<units::current::ampere_t> & Epos4::GetMotorCurrent()
 {
-  return impl_->motorCurrent;
+  return shared_->motorCurrent;
 }
 signals::StatusSignal<units::current::ampere_t> & Epos4::GetMotorCurrentAveraged()
 {
-  return impl_->motorCurrentAveraged;
+  return shared_->motorCurrentAveraged;
 }
 signals::StatusSignal<units::voltage::volt_t> & Epos4::GetSupplyVoltage()
 {
-  return impl_->supplyVoltage;
+  return shared_->supplyVoltage;
 }
 signals::StatusSignal<units::temperature::celsius_t> & Epos4::GetPowerStageTemperature()
 {
-  return impl_->powerStageTemperature;
+  return shared_->powerStageTemperature;
 }
 signals::StatusSignal<units::temperature::celsius_t> & Epos4::GetPowerStageTemperatureLimit()
 {
-  return impl_->powerStageTemperatureLimit;
+  return shared_->powerStageTemperatureLimit;
 }
-signals::StatusSignal<std::uint16_t> & Epos4::GetMotorI2tPercent() {return impl_->motorI2t;}
+signals::StatusSignal<std::uint16_t> & Epos4::GetMotorI2tPercent() {return shared_->motorI2t;}
 signals::StatusSignal<std::uint16_t> & Epos4::GetPowerStageI2tPercent()
 {
-  return impl_->powerStageI2t;
+  return shared_->powerStageI2t;
 }
 signals::StatusSignal<std::uint16_t> & Epos4::GetPwmDutyCyclePerMille()
 {
-  return impl_->pwmDutyCycle;
+  return shared_->pwmDutyCycle;
 }
-signals::StatusSignal<signals::StoInputStates> & Epos4::GetStoInputs() {return impl_->stoInputs;}
+signals::StatusSignal<signals::StoInputStates> & Epos4::GetStoInputs() {return shared_->stoInputs;}
 signals::StatusSignal<signals::StoCardStatus> & Epos4::GetStoCardStatus()
 {
-  return impl_->stoCardStatus;
+  return shared_->stoCardStatus;
 }
-signals::StatusSignal<std::int16_t> & Epos4::GetTorqueAveraged() {return impl_->torqueAveraged;}
-signals::StatusSignal<std::int32_t> & Epos4::GetVelocityAveraged() {return impl_->velocityAveraged;}
-signals::StatusSignal<signals::CanBitRate> & Epos4::GetCanBitRate() {return impl_->canBitRate;}
+signals::StatusSignal<std::int16_t> & Epos4::GetTorqueAveraged() {return shared_->torqueAveraged;}
+signals::StatusSignal<std::int32_t> & Epos4::GetVelocityAveraged()
+{
+  return shared_->velocityAveraged;
+}
+signals::StatusSignal<signals::CanBitRate> & Epos4::GetCanBitRate() {return shared_->canBitRate;}
 signals::StatusSignal<signals::Fieldbus> & Epos4::GetActiveFieldbus()
 {
-  return impl_->activeFieldbus;
+  return shared_->activeFieldbus;
 }
 signals::StatusSignal<std::uint32_t> & Epos4::GetSupportedDriveModes()
 {
-  return impl_->supportedDriveModes;
+  return shared_->supportedDriveModes;
 }
 signals::StatusSignal<units::voltage::volt_t> &
 Epos4::GetAnalogInputVoltage(signals::AnalogInput input)
 {
-  return impl_->analogInputVoltage[static_cast<std::uint8_t>(input) - 1];
+  return shared_->analogInputVoltage[static_cast<std::uint8_t>(input) - 1];
 }
 signals::StatusSignal<units::voltage::volt_t> &
 Epos4::GetAnalogInputGeneralPurpose(signals::AnalogGeneralPurpose value)
 {
-  return impl_->analogInputGeneralPurpose[static_cast<std::uint8_t>(value) - 1];
+  return shared_->analogInputGeneralPurpose[static_cast<std::uint8_t>(value) - 1];
 }
 signals::StatusSignal<units::voltage::volt_t> &
 Epos4::GetAnalogOutputVoltage(signals::AnalogOutput output)
 {
-  return impl_->analogOutputVoltage[static_cast<std::uint8_t>(output) - 1];
+  return shared_->analogOutputVoltage[static_cast<std::uint8_t>(output) - 1];
 }
 
 std::error_code
@@ -1746,34 +1937,37 @@ Epos4::GetSupportedHomingMethods(std::vector<signals::HomingMethod> & out)
   }
   return {};
 }
-signals::StatusSignal<std::uint16_t> & Epos4::GetErrorCode() {return impl_->errorCode;}
-signals::StatusSignal<std::uint8_t> & Epos4::GetErrorRegister() {return impl_->errorRegister;}
-signals::StatusSignal<bool> & Epos4::IsTargetReached() {return impl_->targetReached;}
-signals::StatusSignal<bool> & Epos4::IsSetpointAcknowledged() {return impl_->setpointAcknowledged;}
-signals::StatusSignal<bool> & Epos4::HasFollowingError() {return impl_->followingErrorFlag;}
-signals::StatusSignal<bool> & Epos4::IsHomingAttained() {return impl_->homingAttained;}
-signals::StatusSignal<bool> & Epos4::IsInternalLimitActive() {return impl_->internalLimit;}
-signals::StatusSignal<bool> & Epos4::HasWarning() {return impl_->warning;}
-signals::StatusSignal<bool> & Epos4::HasHomingError() {return impl_->homingError;}
-signals::StatusSignal<bool> & Epos4::IsAtZeroSpeed() {return impl_->atZeroSpeed;}
-signals::StatusSignal<bool> & Epos4::IsFollowingCommand() {return impl_->followingCommand;}
-signals::StatusSignal<bool> & Epos4::IsPositionReferenced() {return impl_->positionReferenced;}
-signals::StatusSignal<bool> & Epos4::IsRemote() {return impl_->remote;}
-signals::StatusSignal<bool> & Epos4::IsVoltageEnabled() {return impl_->voltageEnabled;}
-signals::StatusSignal<signals::BrakeState> & Epos4::GetBrakeState() {return impl_->brakeState;}
-signals::StatusSignal<std::uint32_t> & Epos4::GetDigitalInputs() {return impl_->digitalInputs;}
+signals::StatusSignal<std::uint16_t> & Epos4::GetErrorCode() {return shared_->errorCode;}
+signals::StatusSignal<std::uint8_t> & Epos4::GetErrorRegister() {return shared_->errorRegister;}
+signals::StatusSignal<bool> & Epos4::IsTargetReached() {return shared_->targetReached;}
+signals::StatusSignal<bool> & Epos4::IsSetpointAcknowledged()
+{
+  return shared_->setpointAcknowledged;
+}
+signals::StatusSignal<bool> & Epos4::HasFollowingError() {return shared_->followingErrorFlag;}
+signals::StatusSignal<bool> & Epos4::IsHomingAttained() {return shared_->homingAttained;}
+signals::StatusSignal<bool> & Epos4::IsInternalLimitActive() {return shared_->internalLimit;}
+signals::StatusSignal<bool> & Epos4::HasWarning() {return shared_->warning;}
+signals::StatusSignal<bool> & Epos4::HasHomingError() {return shared_->homingError;}
+signals::StatusSignal<bool> & Epos4::IsAtZeroSpeed() {return shared_->atZeroSpeed;}
+signals::StatusSignal<bool> & Epos4::IsFollowingCommand() {return shared_->followingCommand;}
+signals::StatusSignal<bool> & Epos4::IsPositionReferenced() {return shared_->positionReferenced;}
+signals::StatusSignal<bool> & Epos4::IsRemote() {return shared_->remote;}
+signals::StatusSignal<bool> & Epos4::IsVoltageEnabled() {return shared_->voltageEnabled;}
+signals::StatusSignal<signals::BrakeState> & Epos4::GetBrakeState() {return shared_->brakeState;}
+signals::StatusSignal<std::uint32_t> & Epos4::GetDigitalInputs() {return shared_->digitalInputs;}
 signals::StatusSignal<std::uint32_t> & Epos4::GetMotorRatedTorque()
 {
-  return impl_->motorRatedTorque;
+  return shared_->motorRatedTorque;
 }
 signals::StatusSignal<std::uint32_t> & Epos4::GetDigitalOutputs()
 {
-  return impl_->digitalOutputs;
+  return shared_->digitalOutputs;
 }
 
 signals::StatusSignal<std::uint16_t> & Epos4::GetDigitalOutputPins()
 {
-  return impl_->digitalOutputPins;
+  return shared_->digitalOutputPins;
 }
 
 std::error_code
@@ -1866,7 +2060,7 @@ Epos4::GetTouchProbe(signals::TouchProbeState & out)
 
 signals::StatusSignal<std::uint16_t> & Epos4::GetDigitalInputPins()
 {
-  return impl_->digitalInputPins;
+  return shared_->digitalInputPins;
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,14 +2071,14 @@ template<typename T>
 std::error_code
 Epos4::ReadObject(od::Entry entry, T & value)
 {
-  return impl_->Read<T>(entry, value);
+  return shared_->Read<T>(entry, value);
 }
 
 template<typename T>
 std::error_code
 Epos4::WriteObject(od::Entry entry, T value)
 {
-  return impl_->Write<T>(entry, value);
+  return shared_->Write<T>(entry, value);
 }
 
 // The CANopen basic types. Anything outside this set is not a thing the
@@ -1910,22 +2104,19 @@ namespace epos4
 bool
 Epos4::IsPdoActive() const
 {
-  return impl_ && impl_->PdoActive();
+  return shared_->cyclic.HasReceivedPdo();
 }
 
 std::chrono::steady_clock::duration
 Epos4::GetTimeSinceLastPdo() const
 {
-  if (!impl_) {
-    return std::chrono::steady_clock::duration::max();
-  }
-  return impl_->cyclic.TimeSinceLastPdo(std::chrono::steady_clock::now());
+  return shared_->cyclic.TimeSinceLastPdo(std::chrono::steady_clock::now());
 }
 
 std::chrono::steady_clock::duration
 Epos4::GetTimeSinceLastEmergency() const
 {
-  const long long last = impl_ ? impl_->lastEmcy.load(std::memory_order_relaxed) : 0;
+  const long long last = shared_->lastEmcy.load(std::memory_order_relaxed);
   if (last == 0) {
     return std::chrono::steady_clock::duration::max();
   }
@@ -2074,18 +2265,21 @@ Epos4::ClearErrorHistory()
   return impl_->Write<std::uint8_t>(od::At(od::comm::kErrorHistory, 0), 0);
 }
 
+signals::BootStatus
+Epos4::GetBootStatus() const
+{
+  std::lock_guard<std::mutex> lock{shared_->bootMutex};
+  return shared_->boot;
+}
+
 void
 Epos4::SetEmergencyCallback(std::function<void(const signals::EmergencyMessage &)> callback)
 {
-  // Before Start() there is no Impl yet, and devices are declared before
-  // Start(), so this is exactly when a caller registers the callback. It used
-  // to be dropped here without a word; keep it until Attach() instead.
-  if (!impl_) {
-    pendingEmcyCallback_ = std::move(callback);
-    return;
-  }
-  std::lock_guard<std::mutex> lock{impl_->emcyMutex};
-  impl_->emcyCallback = std::move(callback);
+  // Kept in Shared, where every driver this device gets reads it from: it
+  // used to be dropped when set before Start(), the very moment devices are
+  // set up.
+  std::lock_guard<std::mutex> lock{shared_->emcyMutex};
+  shared_->emcyCallback = std::move(callback);
 }
 
 }  // namespace epos4
@@ -2249,45 +2443,43 @@ Epos4::EnterCyclicTorqueMode()
 void
 Epos4::ExitCyclicMode()
 {
-  if (impl_) {
-    impl_->cyclic.Deactivate();
-  }
+  shared_->cyclic.Deactivate();
 }
 
 bool
 Epos4::IsCyclicModeActive() const
 {
-  return impl_ && impl_->cyclic.IsActive();
+  return shared_->cyclic.IsActive();
 }
 
 std::int32_t
 Epos4::GetCachedPosition() const
 {
-  return impl_ ? impl_->cyclic.Position() : 0;
+  return shared_->cyclic.Position();
 }
 
 std::int32_t
 Epos4::GetCachedVelocity() const
 {
-  return impl_ ? impl_->cyclic.Velocity() : 0;
+  return shared_->cyclic.Velocity();
 }
 
 std::int16_t
 Epos4::GetCachedTorque() const
 {
-  return impl_ ? impl_->cyclic.Torque() : 0;
+  return shared_->cyclic.Torque();
 }
 
 std::uint16_t
 Epos4::GetCachedStatusword() const
 {
-  return impl_ ? impl_->cyclic.Statusword() : 0;
+  return shared_->cyclic.Statusword();
 }
 
 std::uint16_t
 Epos4::GetCachedErrorCode() const
 {
-  return impl_ ? impl_->lastEmcyCode.load(std::memory_order_relaxed) : 0;
+  return shared_->lastEmcyCode.load(std::memory_order_relaxed);
 }
 
 bool
@@ -2324,7 +2516,7 @@ Epos4::StageTargetTorque(TorqueSetpoint torque)
 bool
 Epos4::IsCyclicHealthy(std::chrono::steady_clock::duration maxAge) const
 {
-  return impl_ && impl_->cyclic.IsHealthy(maxAge, std::chrono::steady_clock::now());
+  return shared_->cyclic.IsHealthy(maxAge, std::chrono::steady_clock::now());
 }
 
 }  // namespace epos4

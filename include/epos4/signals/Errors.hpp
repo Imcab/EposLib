@@ -142,4 +142,31 @@ struct EmergencyMessage
 
 std::string Describe(const EmergencyMessage & message);
 
+
+// ---------------------------------------------------------------------------
+// How the master's NMT «boot slave» procedure went for one node (CiA 302-2).
+//
+// The master checks the node's identity against the DCF (0x1F84-0x1F88) and
+// downloads its concise configuration - PDO mapping, heartbeat consumer -
+// before starting it. When a step fails the node is usually still there and
+// still answers SDO, so nothing else reports it: the drive runs with its
+// power-on mapping and the master decodes its frames with its own layout.
+// ---------------------------------------------------------------------------
+struct BootStatus
+{
+  // Boots the master has completed for this node since the bus started; 0
+  // while the first one is still pending.
+  unsigned count{0};
+
+  // Error status of the last boot: 0 when it went through, otherwise the
+  // letter CiA 302-2 assigns ('D' vendor-ID mismatch, 'J' configuration
+  // download failed, 'M' product code mismatch, ...), and Lely's text for it.
+  char errorStatus{0};
+  std::string what;
+
+  // Whether the node was configured as the DCF describes. 'L' (the slave was
+  // already operational) is advisory: the boot went ahead regardless.
+  bool Succeeded() const {return count > 0 && (errorStatus == 0 || errorStatus == 'L');}
+};
+
 }  // namespace epos4::signals
