@@ -127,10 +127,10 @@ private:
 // ---------------------------------------------------------------------------
 // A maxon EPOS4 positioning controller on a CAN bus.
 //
-//   epos4::CanBus bus{{.interface = "can0", .masterDcf = dcf}};
+//   epos4::CanBus bus{{"can0", dcf, 1}};   // interface, master DCF, master node-ID
+//   epos4::Epos4 motor{bus, 2};            // declared before Start(); 1 is the master
 //   bus.Start();
-//
-//   epos4::Epos4 motor{bus, 1};
+//   motor.WaitUntilReady();
 //
 //   epos4::configs::Epos4Configuration cfg;
 //   cfg.positionControl.p = 1500000;
@@ -220,10 +220,10 @@ public:
   // power. How hard it stops is set by MotionProfileConfigs::profileDeceleration.
   //
   // NOTE: what Halt does is formally decided by «Halt option code» (0x605D,
-  // Table 6-152). That object is documented in the manual but is NOT present
-  // in the EDS of the EPOS4 Module 50/15, so it is not exposed here - adding
-  // a setter for an object the device does not implement would only produce
-  // aborts at run time. The behaviour is whatever the firmware ships with.
+  // Table 6-152), which only firmware 0x0180 and later implements - it is not
+  // in the EDS of the EPOS4 Module 50/15 in this repository. Where present it
+  // is set through StopOptionConfigs::halt; otherwise the behaviour is
+  // whatever the firmware ships with.
   std::error_code Halt();
 
   // Triggers the quick stop ramp (Controlword bit 2 driven low). The drive
@@ -658,6 +658,12 @@ public:
   // Clears the stored history by writing 0 to 0x1003:00.
   std::error_code ClearErrorHistory();
 
+  // How the master's last boot of this node went. WaitUntilReady() only
+  // knows that the node answers SDO, which it also does after a boot that
+  // failed its identity check or its configuration download - so check
+  // this once after it, and log `what` if !Succeeded(). No bus access.
+  signals::BootStatus GetBootStatus() const;
+
   // -------------------------------------------------------------------------
   // PDO mapping - inspected, never changed from here (see IsPdoActive()).
   // -------------------------------------------------------------------------
@@ -685,8 +691,7 @@ public:
   // The callback runs on the CANopen thread: keep it short, do not block,
   // and do not call back into this device from it.
   //
-  // May be called before CanBus::Start(); the callback is kept and installed
-  // when the bus attaches the device.
+  // May be called before CanBus::Start(), and survives a restart of the bus.
   void SetEmergencyCallback(std::function<void(const signals::EmergencyMessage &)> callback);
 
   // -------------------------------------------------------------------------
@@ -700,20 +705,32 @@ public:
   std::error_code WriteObject(od::Entry entry, T value);
 
   // Internal. Public only so that free helpers in the implementation file can
-  // reach it; the type itself is opaque outside that file.
+  // reach them; the types themselves are opaque outside that file.
   struct Impl;
+  struct Shared;
 
 private:
   friend class Configurator;
   friend class CanBus;
 
-  // Creates the underlying CANopen driver and wires the status signals.
-  // Called by CanBus::Start(), not by users: the master does not exist until
-  // then, and the driver has to be registered before the node boots for its
-  // PDOs to be routed here.
+  // Creates the underlying CANopen driver. Called by CanBus::Start(), not by
+  // users: the master does not exist until then, and the driver has to be
+  // registered before the node boots for its PDOs to be routed here.
   void Attach(lely_master_t & master);
 
+  // Destroys the driver, on the bus thread if the bus is running. Called by
+  // the destructor, and by CanBus::Start() before it replaces the master of
+  // a previous run, which the driver is registered with.
+  void Detach();
+
+  CanBus & bus_;
   std::uint8_t nodeId_{0};
+
+  // What outlives the driver: the status signals, the cyclic state and the
+  // last EMCY. Created in the constructor, so every accessor works before
+  // CanBus::Start() - reads report not_connected instead of crashing - and
+  // references a caller holds stay valid across a restart of the bus.
+  std::unique_ptr<Shared> shared_;
 
   // Owned by the device, not by Impl, and created in the constructor rather
   // than in Attach(). Neither touches the bus when constructed, and both are
@@ -723,10 +740,8 @@ private:
   std::unique_ptr<Configurator> configurator_;
   std::unique_ptr<Encoder> encoder_;
 
-  // An emergency callback registered before Start(), handed to Impl in
-  // Attach(). See SetEmergencyCallback().
-  std::function<void(const signals::EmergencyMessage &)> pendingEmcyCallback_;
-
+  // Null until CanBus::Start(). Declared last so it is destroyed first: the
+  // driver holds references into shared_.
   std::unique_ptr<Impl> impl_;
 };
 
